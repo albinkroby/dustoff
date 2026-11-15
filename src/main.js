@@ -19,6 +19,31 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} },
 };
 
+// ---------- settings (saved on this PC) ----------
+// The master copy lives in the Dustoff data folder (settings.json). The browser copy below is only a
+// fast cache so the first screen already has the right theme before the file has been read.
+const SETTINGS_DEFAULTS = { theme: "system", startPage: "dashboard", storageView: "list", permanentLeftovers: false, smartPreview: true, warnPct: 80, notify: true };
+let settings = { ...SETTINGS_DEFAULTS };
+try { settings = { ...SETTINGS_DEFAULTS, ...JSON.parse(store.get("settings", "{}")) }; } catch (_) {}
+let settingsReady = false; // true once settings.json has been read, so defaults never overwrite it
+const saveSettings = () => {
+  const json = JSON.stringify(settings);
+  store.set("settings", json);
+  if (settingsReady) invoke("settings_save", { json }).catch(() => {});
+};
+async function loadSettingsFromFile() {
+  try {
+    const raw = await invoke("settings_load");
+    if (raw && raw.trim() !== "{}") settings = { ...SETTINGS_DEFAULTS, ...JSON.parse(raw) };
+  } catch (_) {}
+  settingsReady = true;
+  saveSettings(); // first run after upgrading: copies the browser-cached settings into settings.json
+  applyTheme(settings.theme);
+  setView(settings.storageView);
+  syncSettingsUI();
+  renderDrives();
+}
+
 // ---------- icons ----------
 const IC = {
   back: '<path d="M19 12H5"/><path d="m12 19-7-7 7-7"/>',
@@ -237,9 +262,11 @@ function menuFor(target) {
     const a = apps[Number(ap.dataset.ai)];
     if (!a) return null;
     return [
-      { label: "Uninstall + clean…", icon: "uninstall", danger: true, run: () => confirmUninstall(a) },
+      a.broken
+        ? { label: "Remove broken entry…", icon: "uninstall", danger: true, run: () => confirmFix(a) }
+        : { label: "Uninstall + clean…", icon: "uninstall", danger: true, run: () => confirmUninstall(a) },
       "-",
-      a.install_location && { label: "Show install folder", icon: "external", run: () => reveal(a.install_location) },
+      a.install_location && !a.broken && { label: "Show install folder", icon: "external", run: () => reveal(a.install_location) },
       { label: "Copy app name", icon: "copy", run: () => copyText(a.name, "App name") },
     ].filter(Boolean);
   }
@@ -272,18 +299,14 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ---------- theme ----------
-const themes = ["system", "light", "dark"];
 function applyTheme(t) {
+  if (t !== "light" && t !== "dark") t = "system";
   if (t === "system") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", t);
-  $("#theme-btn").textContent = "Theme: " + t;
-  store.set("theme", t);
+  document.querySelectorAll("#theme-seg .seg-btn").forEach((b) => b.classList.toggle("on", b.dataset.theme === t));
+  if (settings.theme !== t) { settings.theme = t; saveSettings(); }
 }
-$("#theme-btn").addEventListener("click", () => {
-  const cur = store.get("theme", "system");
-  applyTheme(themes[(themes.indexOf(cur) + 1) % themes.length]);
-});
-applyTheme(store.get("theme", "system"));
+applyTheme(settings.theme);
 
 // ---------- navigation ----------
 function show(page) {
@@ -296,6 +319,7 @@ function show(page) {
   if (page === "cleanup" && !loaded.cleanup) loadCaches();
   if (page === "files" && !loaded.files) { loaded.files = true; setupFiles(); }
   if (page === "safety") loadSafety();
+  if (page === "settings") loadSettingsPage();
 }
 document.querySelectorAll(".nav").forEach((n) => n.addEventListener("click", () => show(n.dataset.page)));
 $("#go-cleanup").addEventListener("click", () => show("cleanup"));
@@ -309,8 +333,47 @@ async function loadDrives() {
     renderDrives();
     $("#st-drive").innerHTML = drives.map((d) => `<option value="${d.letter}">${d.letter}:</option>`).join("");
     updatePathBar();
+    evaluateAlerts();
   } catch (e) { toast.error("Couldn't read your drives", errText(e)); }
 }
+
+// ---------- drive alerts: periodic check and Windows notification ----------
+const driveLevel = {};
+let alertsPrimed = false;
+let lastDriveCheck = 0;
+const pctUsed = (d) => Math.round(((d.total - d.free) / d.total) * 100);
+const levelFor = (pct) => (pct >= settings.warnPct + 10 ? 2 : pct >= settings.warnPct ? 1 : 0);
+
+// Sent from the Rust side so a failure comes back with a real reason instead of failing silently.
+async function sendNotification(title, body) {
+  try { await invoke("send_notification", { title, body }); return { ok: true }; }
+  catch (e) { return { ok: false, error: errText(e) }; }
+}
+// Notifies only when a drive gets worse (for example from fine to warning), never at launch.
+function evaluateAlerts() {
+  for (const d of drives) {
+    const pct = pctUsed(d), lvl = levelFor(pct);
+    const prev = driveLevel[d.letter];
+    if (alertsPrimed && prev !== undefined && lvl > prev && settings.notify && settings.warnPct <= 100) {
+      const title = `${d.letter}: is ${pct}% full`;
+      const body = `${fmt(d.free)} free of ${fmt(d.total)}. Open Dustoff and run Smart clean to free some space.`;
+      sendNotification(title, body).then((r) => { if (!r.ok) toast.warning(title, `${body} (Windows notification failed: ${r.error})`); });
+    }
+    driveLevel[d.letter] = lvl;
+  }
+  alertsPrimed = true;
+}
+async function checkDrives(force = false) {
+  if (!force && Date.now() - lastDriveCheck < 30000) return;
+  lastDriveCheck = Date.now();
+  try {
+    drives = await invoke("list_drives");
+    renderDrives();
+    evaluateAlerts();
+  } catch (_) {}
+}
+setInterval(() => checkDrives(), 5 * 60 * 1000);
+window.addEventListener("focus", () => checkDrives());
 function renderDrives() {
   $("#drive-chips").innerHTML = drives.length > 1
     ? drives.map((d) => {
@@ -324,7 +387,14 @@ function renderDrives() {
   const pct = Math.round((used / d.total) * 100);
   const circ = 2 * Math.PI * 44;
   $("#ring").setAttribute("stroke-dasharray", `${(circ * pct) / 100} ${circ}`);
-  $("#ring").setAttribute("class", "ring-fg" + (pct >= 90 ? " crit" : pct >= 80 ? " warn" : ""));
+  const warnAt = settings.warnPct, critAt = warnAt + 10;
+  $("#ring").setAttribute("class", "ring-fg" + (pct >= critAt ? " crit" : pct >= warnAt ? " warn" : ""));
+  const banner = $("#warn-banner");
+  if (pct >= warnAt) {
+    banner.classList.remove("hidden");
+    banner.classList.toggle("crit", pct >= critAt);
+    $("span", banner).textContent = `${d.letter}: is ${pct}% full, with ${fmt(d.free)} left. Clearing caches is a quick way to free some space.`;
+  } else banner.classList.add("hidden");
   $("#ring-text").textContent = pct + "%";
   $("#drive-label").textContent = d.letter + ": drive";
   $("#free-text").textContent = fmt(d.free) + " free";
@@ -394,13 +464,13 @@ function agoLabel(iso) {
 function appRow(a, i, withButton) {
   const meta = [a.publisher, a.version].filter(Boolean).map(esc).join(" · ");
   return `<div class="row" ${withButton ? `data-ai="${i}"` : ""}><div class="avatar" data-ik="${esc(ikey(a))}" style="--h:${hue(a.name)}">${esc((a.name[0] || "?").toUpperCase())}</div>
-    <div class="grow"><div class="title">${esc(a.name)}</div><div class="small muted title">${meta}</div></div>
+    <div class="grow"><div class="title">${esc(a.name)}${a.broken ? ' <span class="badge warn" title="Windows lists this app, but its uninstaller is missing">Broken entry</span>' : ""}</div><div class="small muted title">${meta}</div></div>
     <div class="dates small muted">
       <div title="${a.installed_approx ? "Approximate: the date Windows last changed this app's entry" : "Install date reported by the app"}">${a.installed ? `${a.installed_approx ? "Updated" : "Installed"} ${esc(dateLabel(a.installed))}` : "Install date unknown"}</div>
       <div title="From Windows launch history. Apps never opened from Start or Explorer show as unknown.">${a.last_used ? `Last used ${esc(agoLabel(a.last_used))}` : "Last used unknown"}</div>
     </div>
     <div class="size">${a.size ? fmt(a.size) : "—"}</div>
-    ${withButton ? `<button class="btn" data-uninstall="${i}">Uninstall + clean</button>` : ""}</div>`;
+    ${withButton ? (a.broken ? `<button class="btn" data-fix="${i}">Remove entry</button>` : `<button class="btn" data-uninstall="${i}">Uninstall + clean</button>`) : ""}</div>`;
 }
 async function loadApps() {
   loaded.apps = true;
@@ -434,7 +504,9 @@ $("#app-sort").addEventListener("change", (e) => { sortBy = e.target.value; rend
 $("#refresh-apps").addEventListener("click", () => { loaded.apps = false; $("#apps-list").className = "muted pad"; $("#apps-list").innerHTML = '<span class="spin"></span>Loading…'; loadApps(); });
 $("#apps-list").addEventListener("click", (e) => {
   const b = e.target.closest("[data-uninstall]");
-  if (b) confirmUninstall(apps[Number(b.dataset.uninstall)]);
+  if (b) { confirmUninstall(apps[Number(b.dataset.uninstall)]); return; }
+  const f = e.target.closest("[data-fix]");
+  if (f) confirmFix(apps[Number(f.dataset.fix)]);
 });
 
 function confirmUninstall(app) {
@@ -458,6 +530,28 @@ function confirmUninstall(app) {
     }
   };
 }
+// An app whose uninstaller is already gone: Windows still lists it, but it can't be uninstalled normally.
+function confirmFix(app) {
+  modal(`<h2>Remove the broken entry for ${esc(app.name)}?</h2>
+    <p class="muted">Windows still lists this app, but its uninstaller and program files are already gone, so it can't be uninstalled the normal way. Dustoff will remove the leftover entry from the installed apps list, then let you review any data the app left behind.</p>
+    <div class="btns"><button class="btn" id="m-cancel">Cancel</button><button class="btn danger" id="m-go">Remove entry</button></div>`);
+  $("#m-cancel").onclick = closeModal;
+  $("#m-go").onclick = async () => {
+    modal(`<h2>Removing the entry…</h2><p class="muted"><span class="spin"></span>One moment.</p>`);
+    try { await invoke("remove_broken_entry", { name: app.name, version: app.version }); }
+    catch (e) { closeModal(); toast.error(`Couldn't remove ${app.name}`, errText(e)); return; }
+    modal(`<h2>Looking for leftovers…</h2><p class="muted"><span class="spin"></span>Scanning app data folders.</p>`);
+    try {
+      const left = await invoke("find_leftovers", { name: app.name, publisher: app.publisher, installLocation: app.install_location });
+      loaded.apps = false; loadApps(); loadDrives(); refreshSafetyIfOpen();
+      reviewLeftovers(app, left);
+    } catch (e) {
+      closeModal();
+      loaded.apps = false; loadApps();
+      toast.warning(`${app.name} was removed from the list`, errText(e));
+    }
+  };
+}
 function reviewLeftovers(app, left) {
   if (!left.length) {
     closeModal();
@@ -468,7 +562,7 @@ function reviewLeftovers(app, left) {
   modal(`<h2>Leftover data for ${esc(app.name)}</h2>
     <p class="muted">Found ${fmt(total)} in ${plural(left.length, "folder", "folders")}. Untick anything you want to keep.</p>
     <div id="lo-list">${left.map((l, i) => `<label class="chk"><input type="checkbox" checked data-i="${i}" /><div class="grow"><div class="p">${esc(l.path)}</div><div class="small muted">${fmt(l.size)}</div></div></label>`).join("")}</div>
-    <label class="opt"><input type="checkbox" id="lo-perm" /> Delete permanently (otherwise moved to the Recycle Bin)</label>
+    <label class="opt"><input type="checkbox" id="lo-perm" ${settings.permanentLeftovers ? "checked" : ""} /> Delete permanently (otherwise moved to the Recycle Bin)</label>
     <div class="btns"><button class="btn" id="m-cancel">Keep all</button><button class="btn danger" id="m-del">Remove selected</button></div>`);
   $("#m-cancel").onclick = () => { closeModal(); toast.info(`${app.name} uninstalled`, "Leftover folders were kept."); };
   $("#m-del").onclick = async () => {
@@ -490,7 +584,7 @@ let hist = [], hidx = -1;
 let scanId = 0;
 let cur = { path: "", items: [], total: 0, loading: false, error: "" };
 const scanCache = new Map();
-let view = store.get("view", "list");
+let view = settings.storageView;
 let renderTimer = null;
 
 function normalizePath(p) {
@@ -630,7 +724,7 @@ $("#st-path").addEventListener("keydown", (e) => { if (e.key === "Enter") go($("
 $("#st-drive").addEventListener("change", (e) => go(e.target.value + ":\\"));
 $("#st-refresh").onclick = () => { const p = hist[hidx]; if (p) { scanCache.delete(p); go(p, false, true); } };
 function setView(v) {
-  view = v; store.set("view", v);
+  view = v; settings.storageView = v; saveSettings();
   $("#view-list").classList.toggle("on", v === "list");
   $("#view-tree").classList.toggle("on", v === "tree");
   if (cur.path) renderStorage();
@@ -820,6 +914,7 @@ async function smartClean() {
   if (!caches.length) await loadCaches();
   const items = caches.filter((c) => c.default_on);
   if (!items.length) { toast.info("Nothing to clean", "No safe cache items were found right now."); return; }
+  if (!settings.smartPreview) { runClean(items.map((c) => c.id), "Smart clean", true); return; }
   const total = items.reduce((s, c) => s + c.size, 0);
   modal(`<h2>Smart clean</h2>
     <p class="muted">Dustoff will clean only these safe items. Browser caches, app caches and the Recycle Bin are not touched, and folders you protected are skipped.</p>
@@ -921,13 +1016,61 @@ $("#hist-clear").onclick = () => {
 };
 $("#refresh-safety").onclick = loadSafety;
 
+// ---------- settings page ----------
+function syncSettingsUI() {
+  $("#set-start").value = settings.startPage;
+  $("#set-view").value = settings.storageView;
+  $("#set-perm").checked = settings.permanentLeftovers;
+  $("#set-preview").checked = settings.smartPreview;
+  $("#set-warn").value = String(settings.warnPct);
+  $("#set-notify").checked = settings.notify;
+}
+async function loadSettingsPage() {
+  syncSettingsUI();
+  try { $("#set-folder").textContent = await invoke("data_folder"); } catch (_) { $("#set-folder").textContent = "Unavailable"; }
+  let v = "0.1.0";
+  try { if (T && T.app && T.app.getVersion) v = await T.app.getVersion(); } catch (_) {}
+  $("#set-version").textContent = `Dustoff ${v} · MIT license`;
+}
+$("#set-start").addEventListener("change", (e) => { settings.startPage = e.target.value; saveSettings(); });
+$("#set-view").addEventListener("change", (e) => { setView(e.target.value); });
+$("#set-perm").addEventListener("change", (e) => { settings.permanentLeftovers = e.target.checked; saveSettings(); });
+$("#set-preview").addEventListener("change", (e) => { settings.smartPreview = e.target.checked; saveSettings(); });
+$("#set-warn").addEventListener("change", (e) => {
+  settings.warnPct = Number(e.target.value); saveSettings(); renderDrives();
+  for (const d of drives) driveLevel[d.letter] = levelFor(pctUsed(d)); // re-baseline so changing the level doesn't fire a notification
+ 
+});
+$("#set-notify").addEventListener("change", (e) => { settings.notify = e.target.checked; saveSettings(); });
+$("#set-test").onclick = async () => {
+  const r = await sendNotification("Dustoff test", "Notifications are working. You'll get one like this when a drive is nearly full.");
+  // On success the Windows popup is the confirmation, so nothing is shown inside the app.
+  if (!r.ok) toast.error("Windows didn't show the notification", r.error);
+};
+document.querySelectorAll("#theme-seg .seg-btn").forEach((b) => b.addEventListener("click", () => { applyTheme(b.dataset.theme); }));
+$("#set-open").onclick = async () => { try { await invoke("open_data_folder"); } catch (e) { toast.error("Couldn't open the folder", errText(e)); } };
+$("#set-reset").onclick = () => {
+  modal(`<h2>Reset settings?</h2><p class="muted">Theme, start page, view and the options on this page go back to their defaults. Your protected folders and activity log are not changed.</p>
+    <div class="btns"><button class="btn" id="m-cancel">Cancel</button><button class="btn danger" id="m-go">Reset</button></div>`);
+  $("#m-cancel").onclick = closeModal;
+  $("#m-go").onclick = () => {
+    closeModal();
+    settings = { ...SETTINGS_DEFAULTS };
+    applyTheme("system"); setView("list"); saveSettings(); syncSettingsUI(); renderDrives();
+    toast.success("Settings reset", "Everything is back to its default.");
+  };
+};
+$("#banner-clean").onclick = smartClean;
+
 // ---------- boot ----------
 decorateIcons();
-["#app-sort", "#st-drive", "#fl-scope", "#fl-min"].forEach((s) => enhanceSelect($(s)));
+["#app-sort", "#st-drive", "#fl-scope", "#fl-min", "#set-start", "#set-view", "#set-warn"].forEach((s) => enhanceSelect($(s)));
 (async function init() {
+  await loadSettingsFromFile();
   try { userDir = await invoke("user_profile"); } catch (_) {}
   try { known = await invoke("known_folders"); } catch (_) {}
   await loadDrives();
   loadApps();
   loadCaches();
+  if (settings.startPage && settings.startPage !== "dashboard") show(settings.startPage);
 })();

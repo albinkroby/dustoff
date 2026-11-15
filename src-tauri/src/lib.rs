@@ -272,6 +272,8 @@ struct AppInfo {
     installed: String,
     installed_approx: bool,
     last_used: String,
+    /// The uninstaller file is gone, so Windows still lists the app but it can't be uninstalled.
+    broken: bool,
 }
 
 struct RawApp {
@@ -279,6 +281,36 @@ struct RawApp {
     uninstall: String,
     est_kb: u64,
     display_icon: String,
+    /// 0 = HKLM, 1 = HKLM (32-bit view), 2 = HKCU
+    hive: u8,
+    key_name: String,
+}
+
+const UNINSTALL_KEYS: [&str; 3] = [
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+];
+
+fn uninstall_exe(s: &str) -> Option<PathBuf> {
+    let s = s.trim();
+    if s.to_lowercase().starts_with("msiexec") {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(PathBuf::from(&rest[..end]));
+    }
+    let lower = s.to_lowercase();
+    lower.find(".exe").map(|i| PathBuf::from(&s[..i + 4]))
+}
+
+/// True only when the uninstall command points at an absolute path that no longer exists.
+fn is_broken(uninstall: &str) -> bool {
+    match uninstall_exe(&expand_env(uninstall)) {
+        Some(p) => p.is_absolute() && !p.exists(),
+        None => false,
+    }
 }
 
 fn read_registry_apps() -> Vec<RawApp> {
@@ -291,7 +323,7 @@ fn read_registry_apps() -> Vec<RawApp> {
     ];
     let mut out = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for (hive, path) in roots.iter() {
+    for (hive_idx, (hive, path)) in roots.iter().enumerate() {
         let Ok(key) = hive.open_subkey(path) else { continue };
         for name_key in key.enum_keys().filter_map(|k| k.ok()) {
             let Ok(k) = key.open_subkey(&name_key) else { continue };
@@ -339,6 +371,8 @@ fn read_registry_apps() -> Vec<RawApp> {
             let display_icon: String = k.get_value("DisplayIcon").unwrap_or_default();
             out.push(RawApp {
                 display_icon,
+                hive: hive_idx as u8,
+                key_name: name_key.clone(),
                 info: AppInfo {
                     name,
                     version,
@@ -347,6 +381,7 @@ fn read_registry_apps() -> Vec<RawApp> {
                     installed,
                     installed_approx,
                     last_used: String::new(),
+                    broken: is_broken(&uninstall),
                     install_location: loc.trim().trim_matches('"').to_string(),
                 },
                 uninstall,
@@ -663,6 +698,9 @@ async fn uninstall_app(name: String, version: String) -> Result<String, String> 
             .into_iter()
             .find(|a| a.info.name == name && a.info.version == version)
             .ok_or_else(|| "That app isn't registered as installed anymore".to_string())?;
+        if is_broken(&app.uninstall) {
+            return Err("This app's uninstaller is missing, so it can't be uninstalled. Remove the broken entry instead.".into());
+        }
         let status = std::process::Command::new("cmd")
             .raw_arg(format!("/C \"{}\"", app.uninstall))
             .creation_flags(CREATE_NO_WINDOW)
@@ -673,6 +711,38 @@ async fn uninstall_app(name: String, version: String) -> Result<String, String> 
             record_history("uninstall", format!("Uninstalled {}", name), 0, vec![]);
         }
         Ok(format!("Uninstaller finished (exit code {})", status.code().unwrap_or(-1)))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    r
+}
+
+fn registry_error(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        "Windows needs administrator rights to remove this entry. Close Dustoff, right-click it, choose Run as administrator, and try again.".to_string()
+    } else {
+        format!("Couldn't change the registry: {}", e)
+    }
+}
+
+/// Removes the entry of an app whose uninstaller no longer exists (a "ghost" in the installed apps list).
+#[tauri::command]
+async fn remove_broken_entry(name: String, version: String) -> Result<(), String> {
+    let r = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let app = read_registry_apps()
+            .into_iter()
+            .find(|a| a.info.name == name && a.info.version == version)
+            .ok_or_else(|| "That app isn't registered as installed anymore".to_string())?;
+        if !is_broken(&app.uninstall) {
+            return Err("This app's uninstaller still exists, so use Uninstall instead.".into());
+        }
+        let hk = if app.hive == 2 { RegKey::predef(HKEY_CURRENT_USER) } else { RegKey::predef(HKEY_LOCAL_MACHINE) };
+        let parent = hk
+            .open_subkey_with_flags(UNINSTALL_KEYS[app.hive as usize], KEY_ALL_ACCESS)
+            .map_err(registry_error)?;
+        parent.delete_subkey_all(&app.key_name).map_err(registry_error)?;
+        record_history("uninstall", format!("Removed broken entry for {}", name), 0, vec![]);
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -738,6 +808,44 @@ fn conflict_with(p: &Path, list: &[String]) -> Option<String> {
 
 fn protected_conflict(p: &Path) -> Option<String> {
     conflict_with(p, &load_protected())
+}
+
+/// Shows a Windows notification (toast). Returns the real error if Windows refuses it.
+#[tauri::command]
+fn send_notification(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| format!("Windows didn't show the notification: {}", e))
+}
+
+#[tauri::command]
+fn settings_load() -> String {
+    std::fs::read_to_string(data_dir().join("settings.json")).unwrap_or_else(|_| "{}".into())
+}
+
+#[tauri::command]
+fn settings_save(json: String) -> Result<(), String> {
+    serde_json::from_str::<serde_json::Value>(&json).map_err(|e| format!("Invalid settings: {}", e))?;
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::write(data_dir().join("settings.json"), json).map_err(|e| format!("Couldn't save settings: {}", e))
+}
+
+#[tauri::command]
+fn data_folder() -> String {
+    data_dir().to_string_lossy().into_owned()
+}
+
+#[tauri::command]
+fn open_data_folder() -> Result<(), String> {
+    std::process::Command::new("explorer.exe")
+        .arg(data_dir())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Couldn't open File Explorer: {}", e))
 }
 
 #[tauri::command]
@@ -988,6 +1096,35 @@ async fn find_leftovers(
                     for g in rd2.filter_map(|e| e.ok()).map(|e| e.path()) {
                         if g.is_dir() && matches(&name_of(&g)) {
                             found.push(g);
+                        }
+                    }
+                }
+            }
+        }
+        // Start Menu shortcuts and the publisher folder that Squirrel/Electron installers leave behind.
+        if let Some(app_data) = env_path("APPDATA") {
+            let programs = app_data.join("Microsoft").join("Windows").join("Start Menu").join("Programs");
+            let stem_of = |p: &Path| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let publisher_norm = norm(&publisher);
+            if let Ok(rd) = std::fs::read_dir(&programs) {
+                for child in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+                    let nm = name_of(&child);
+                    if child.is_file() {
+                        let is_lnk = child.extension().map(|x| x.eq_ignore_ascii_case("lnk")).unwrap_or(false);
+                        if is_lnk && matches(&stem_of(&child)) {
+                            found.push(child);
+                        }
+                    } else if child.is_dir() {
+                        if matches(&nm) {
+                            found.push(child);
+                        } else if !publisher_norm.is_empty() && norm(&nm) == publisher_norm {
+                            // a publisher folder is removed only when it holds nothing but this app's shortcuts
+                            let only_ours = std::fs::read_dir(&child)
+                                .map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).all(|p| p.is_file() && matches(&stem_of(&p))))
+                                .unwrap_or(false);
+                            if only_ours {
+                                found.push(child);
+                            }
                         }
                     }
                 }
@@ -1571,6 +1708,7 @@ async fn clean_cache(app: tauri::AppHandle, ids: Vec<String>, title: Option<Stri
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             list_drives,
             user_profile,
@@ -1593,7 +1731,13 @@ pub fn run() {
             protect_remove,
             list_history,
             clear_history,
-            undo_entry
+            undo_entry,
+            data_folder,
+            open_data_folder,
+            settings_load,
+            settings_save,
+            send_notification,
+            remove_broken_entry
         ])
         .run(tauri::generate_context!())
         .expect("error while running Dustoff");
@@ -1602,6 +1746,18 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_entries_are_detected_without_false_alarms() {
+        // an uninstaller that no longer exists is broken
+        assert!(is_broken(r#""C:\definitely\missing\folder\Update.exe" --uninstall"#));
+        assert!(is_broken(r"C:\definitely\missing\unins000.exe /SILENT"));
+        // MSI uninstalls, existing programs and relative commands are not flagged
+        assert!(!is_broken("MsiExec.exe /X{12345678-1234-1234-1234-123456789012}"));
+        assert!(!is_broken(r#""C:\Windows\System32\cmd.exe" /c echo hi"#));
+        assert!(!is_broken("rundll32.exe shell32.dll,Control_RunDLL"));
+        assert!(!is_broken(""));
+    }
 
     #[test]
     fn dates_convert_correctly() {
@@ -1640,6 +1796,8 @@ mod tests {
         let with_install = apps.iter().filter(|a| !a.info.installed.is_empty()).count();
         let with_used = apps.iter().filter(|a| !last_used_for(a, &ua).is_empty()).count();
         println!("apps: {}, with install date: {}, with last-used: {}, userassist entries: {}", apps.len(), with_install, with_used, ua.len());
+        let broken: Vec<String> = apps.iter().filter(|a| a.info.broken).map(|a| format!("{} ({})", a.info.name, a.info.version)).collect();
+        println!("broken entries on this PC: {:?}", broken);
         for a in apps.iter().take(8) {
             println!("  {} | installed {} ({}) | last used {}", a.info.name, a.info.installed, if a.info.installed_approx { "approx" } else { "exact" }, last_used_for(a, &ua));
         }

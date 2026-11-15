@@ -17,14 +17,15 @@
         <button class="nav" data-page="files">Files</button>
         <button class="nav" data-page="cleanup">Cleanup</button>
         <button class="nav" data-page="safety">Safety</button>
+        <button class="nav" data-page="settings">Settings</button>
       </nav>
-      <button class="btn theme-btn" id="theme-btn" title="Switch theme">Theme: system</button>
       <p class="side-note">Nothing is deleted without a preview and your confirmation.</p>
     </aside>
 
     <main class="main">
       <section id="page-dashboard" class="page">
         <div class="head"><h1>Dashboard</h1><button class="btn" id="refresh-dash" data-icon="refresh">Refresh</button></div>
+        <div id="warn-banner" class="banner hidden"><span></span><button class="btn small-btn" id="banner-clean">Smart clean</button></div>
         <div id="drive-chips" class="chips"></div>
         <div class="grid2">
           <div class="card ringcard">
@@ -137,6 +138,82 @@
           <div class="card-title head"><span>Activity log</span><button class="btn" id="hist-clear">Clear log</button></div>
           <p class="small muted">Everything Dustoff removed. Items moved to the Recycle Bin can be restored while they are still there.</p>
           <div id="hist-list"></div>
+        </div>
+      </section>
+      <section id="page-settings" class="page hidden">
+        <div class="head"><h1>Settings</h1><button class="btn" id="set-reset">Reset to defaults</button></div>
+
+        <div class="card list sec">
+          <div class="card-title">Appearance</div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Theme</div><div class="small muted">Follow Windows, or choose light or dark.</div></div>
+            <div class="seg" id="theme-seg" role="group" aria-label="Theme">
+              <button class="seg-btn" data-theme="system">System</button>
+              <button class="seg-btn" data-theme="light">Light</button>
+              <button class="seg-btn" data-theme="dark">Dark</button>
+            </div>
+          </div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Start page</div><div class="small muted">The page Dustoff opens on.</div></div>
+            <select id="set-start" aria-label="Start page">
+              <option value="dashboard">Dashboard</option>
+              <option value="apps">Apps</option>
+              <option value="storage">Storage</option>
+              <option value="files">Files</option>
+              <option value="cleanup">Cleanup</option>
+            </select>
+          </div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Storage view</div><div class="small muted">How folders are shown by default.</div></div>
+            <select id="set-view" aria-label="Storage view">
+              <option value="list">List</option>
+              <option value="tree">Treemap</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card list sec">
+          <div class="card-title">Cleaning</div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Delete leftovers permanently</div><div class="small muted">When off, leftover folders go to the Recycle Bin so you can restore them. You can still change this each time.</div></div>
+            <label class="switch"><input type="checkbox" id="set-perm" /><span class="slider"></span></label>
+          </div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Preview before Smart clean</div><div class="small muted">Show what will be cleaned and ask to confirm. Turn off to start Smart clean right away.</div></div>
+            <label class="switch"><input type="checkbox" id="set-preview" /><span class="slider"></span></label>
+          </div>
+          <p class="small muted note">Deleting files, folders and apps always asks for confirmation. That can't be turned off.</p>
+        </div>
+
+        <div class="card list sec">
+          <div class="card-title">Alerts</div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Warn when a drive is nearly full</div><div class="small muted">Shows a banner on the Dashboard and turns the usage ring amber, then red.</div></div>
+            <select id="set-warn" aria-label="Warning level">
+              <option value="70">70% full</option>
+              <option value="80">80% full</option>
+              <option value="85">85% full</option>
+              <option value="90">90% full</option>
+              <option value="101">Never</option>
+            </select>
+          </div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Windows notification</div><div class="small muted">Dustoff checks your drives every few minutes while it's open, and sends a notification when one passes the level above. It can't alert you while Dustoff is closed.</div></div>
+            <button class="btn" id="set-test">Send test</button>
+            <label class="switch"><input type="checkbox" id="set-notify" /><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <div class="card list sec">
+          <div class="card-title">Data and about</div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Dustoff data folder</div><div class="small muted p" id="set-folder">…</div></div>
+            <button class="btn" id="set-open">Open folder</button>
+          </div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Version</div><div class="small muted" id="set-version">Dustoff</div></div>
+          </div>
+          <p class="small muted note">Dustoff works entirely on your PC. It stores only your settings, protected folders and activity log in the folder above, and never sends anything anywhere.</p>
         </div>
       </section>
     </main>

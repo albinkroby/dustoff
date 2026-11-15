@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dustoff</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <div class="brand"><img class="logo" src="logo.png" alt="" />Dustoff</div>
+      <nav>
+        <button class="nav on" data-page="dashboard">Dashboard</button>
+        <button class="nav" data-page="apps">Apps</button>
+        <button class="nav" data-page="storage">Storage</button>
+        <button class="nav" data-page="files">Files</button>
+        <button class="nav" data-page="cleanup">Cleanup</button>
+      </nav>
+      <button class="btn theme-btn" id="theme-btn" title="Switch theme">Theme: system</button>
+      <p class="side-note">Nothing is deleted without a preview and your confirmation.</p>
+    </aside>
+
+    <main class="main">
+      <section id="page-dashboard" class="page">
+        <div class="head"><h1>Dashboard</h1><button class="btn" id="refresh-dash">Refresh</button></div>
+        <div id="drive-chips" class="chips"></div>
+        <div class="grid2">
+          <div class="card ringcard">
+            <svg width="110" height="110" viewBox="0 0 110 110" role="img" aria-label="Disk usage">
+              <circle cx="55" cy="55" r="44" class="ring-bg" />
+              <circle id="ring" cx="55" cy="55" r="44" class="ring-fg" stroke-dasharray="0 277" transform="rotate(-90 55 55)" />
+              <text id="ring-text" x="55" y="61" text-anchor="middle" class="ring-text">--</text>
+            </svg>
+            <div>
+              <div class="muted" id="drive-label">Drive</div>
+              <div class="big" id="free-text">--</div>
+              <div class="small muted" id="total-text"></div>
+            </div>
+          </div>
+          <div class="card soft">
+            <div class="soft-label">Reclaimable cache space</div>
+            <div class="big soft-big" id="reclaim">--</div>
+            <button class="btn primary" id="go-cleanup">Review and clean</button>
+          </div>
+        </div>
+        <div class="card list">
+          <div class="card-title head"><span>Largest apps</span><button class="btn" id="view-apps">View all</button></div>
+          <div id="dash-apps" class="muted pad">Loading…</div>
+        </div>
+      </section>
+
+      <section id="page-apps" class="page hidden">
+        <div class="head"><h1>Apps</h1><button class="btn" id="refresh-apps">Refresh</button></div>
+        <div class="toolbar">
+          <input id="app-search" class="search" type="search" placeholder="Search installed apps" />
+          <select id="app-sort" class="select" aria-label="Sort apps">
+            <option value="size">Largest first</option>
+            <option value="name">Name A to Z</option>
+          </select>
+        </div>
+        <div id="app-count" class="small muted count"></div>
+        <div class="card list"><div id="apps-list" class="muted pad">Loading…</div></div>
+      </section>
+
+      <section id="page-storage" class="page hidden">
+        <div class="head"><h1>Storage</h1>
+          <div class="seg" role="group" aria-label="View">
+            <button class="seg-btn on" id="view-list">List</button>
+            <button class="seg-btn" id="view-tree">Treemap</button>
+          </div>
+        </div>
+        <div class="pathbar">
+          <button class="btn icon" id="st-back" title="Back" aria-label="Back">&larr;</button>
+          <button class="btn icon" id="st-fwd" title="Forward" aria-label="Forward">&rarr;</button>
+          <button class="btn icon" id="st-up" title="Up one level" aria-label="Up one level">&uarr;</button>
+          <select id="st-drive" class="select" aria-label="Drive"></select>
+          <input id="st-path" class="search pathinput" type="text" spellcheck="false" aria-label="Folder path" />
+          <button class="btn" id="st-go">Go</button>
+          <button class="btn" id="st-refresh">Refresh</button>
+        </div>
+        <div id="st-status" class="small muted count"></div>
+        <div class="card list" id="st-card"><div id="st-list"></div></div>
+      </section>
+
+      <section id="page-files" class="page hidden">
+        <div class="head"><h1>Files</h1></div>
+        <div class="seg" role="group" aria-label="Mode" style="margin-bottom:12px">
+          <button class="seg-btn on" id="mode-large">Large files</button>
+          <button class="seg-btn" id="mode-dups">Duplicates</button>
+        </div>
+        <div class="toolbar wrap">
+          <select id="fl-scope" class="select" aria-label="Where to look"></select>
+          <input id="fl-custom" class="search hidden" type="text" spellcheck="false" placeholder="C:\path\to\folder" />
+          <select id="fl-min" class="select" aria-label="Minimum size"></select>
+          <button class="btn primary" id="fl-scan">Scan</button>
+          <button class="btn hidden" id="fl-cancel">Cancel</button>
+        </div>
+        <div id="fl-status" class="small muted count"></div>
+        <div id="fl-results"></div>
+        <div class="actions hidden" id="fl-actions">
+          <button class="btn" id="fl-auto">Select extra copies</button>
+          <button class="btn danger" id="fl-trash">Move selected to Recycle Bin</button>
+        </div>
+      </section>
+
+      <section id="page-cleanup" class="page hidden">
+        <div class="head"><h1>Cleanup</h1><button class="btn" id="refresh-cleanup">Refresh</button></div>
+        <p class="muted">Caches that apps rebuild automatically. Safe items are ticked. Browser, app and Recycle Bin items start unticked so you choose them yourself. Files in use are skipped.</p>
+        <div class="card list"><div id="cache-list" class="muted pad">Loading…</div></div>
+        <div class="actions"><button class="btn primary" id="clean-btn">Clean selected</button></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="overlay hidden"><div class="modal" id="modal-box"></div></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="main.js"></script>
+</body>
+</html>

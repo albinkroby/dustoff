@@ -1,0 +1,18 @@
+# Build output and dependencies
+/node_modules/
+/src-tauri/target/
+/src-tauri/gen/
+
+# Generated icon variants for platforms this app does not target
+/src-tauri/icons/android/
+/src-tauri/icons/ios/
+
+# Local, non-source material (Store submission, branding exports, demo data)
+/store/
+/branding/
+
+# Logs and editor/tool folders
+*.log
+.vscode/
+.idea/
+.claude/

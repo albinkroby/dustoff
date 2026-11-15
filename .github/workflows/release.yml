@@ -1,0 +1,80 @@
+name: Release
+
+# A release is created only when a version tag such as v0.1.0 is pushed,
+# and only if the tagged commit is already on the main branch.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify tag is on main and matches app version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tagged commit must be on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points to a commit that is not on the main branch. Merge it into main first, then tag main."
+            exit 1
+          fi
+
+      - name: Tag must match the version in tauri.conf.json
+        run: |
+          app_version="$(jq -r '.version' src-tauri/tauri.conf.json)"
+          if [ "v${app_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match app version v${app_version} in src-tauri/tauri.conf.json."
+            exit 1
+          fi
+
+  release:
+    name: Build and publish Windows installers
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and create release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Dustoff ${{ github.ref_name }}"
+          releaseBody: |
+            Windows installers for Dustoff ${{ github.ref_name }}.
+
+            - `Dustoff_*_x64-setup.exe`: standard installer
+            - `Dustoff_*_x64_en-US.msi`: MSI installer
+
+            The installers are not code-signed, so Windows SmartScreen may show a warning on first run.
+          releaseDraft: true
+          prerelease: false

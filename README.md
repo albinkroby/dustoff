@@ -34,6 +34,22 @@ npm run dev      # run in development mode
 npm run build    # produce the installers in src-tauri/target/release/bundle
 ```
 
+## Releasing
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) and only from the `main` branch:
+
+1. Update `version` in `src-tauri/tauri.conf.json` (and `src-tauri/Cargo.toml`), commit, and merge to `main`.
+2. Tag the commit on `main` and push the tag:
+   ```powershell
+   git checkout main
+   git pull
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+3. The workflow checks that the tag is on `main` and matches the app version, builds the Windows installers, and creates a **draft** release. Review it on the Releases page and press Publish.
+
+If the tag is not on `main` or does not match the version, the workflow stops and no release is created.
+
 ## Project layout
 
 ```

@@ -1,5 +1,5 @@
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -8,6 +8,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use winreg::enums::*;
 use winreg::RegKey;
@@ -267,6 +269,9 @@ struct AppInfo {
     publisher: String,
     size: u64,
     install_location: String,
+    installed: String,
+    installed_approx: bool,
+    last_used: String,
 }
 
 struct RawApp {
@@ -313,6 +318,24 @@ fn read_registry_apps() -> Vec<RawApp> {
             let publisher: String = k.get_value("Publisher").unwrap_or_default();
             let est: u32 = k.get_value("EstimatedSize").unwrap_or(0);
             let loc: String = k.get_value("InstallLocation").unwrap_or_default();
+            let inst_raw: String = k.get_value("InstallDate").unwrap_or_else(|_| {
+                k.get_value::<u32, _>("InstallDate").map(|v| v.to_string()).unwrap_or_default()
+            });
+            let mut installed = if inst_raw.len() == 8 && inst_raw.chars().all(|c| c.is_ascii_digit()) {
+                format!("{}-{}-{}", &inst_raw[0..4], &inst_raw[4..6], &inst_raw[6..8])
+            } else {
+                String::new()
+            };
+            let mut installed_approx = false;
+            if installed.is_empty() {
+                if let Ok(meta) = k.query_info() {
+                    let t = meta.get_last_write_time_system();
+                    if t.wYear > 1990 {
+                        installed = format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay);
+                        installed_approx = true;
+                    }
+                }
+            }
             let display_icon: String = k.get_value("DisplayIcon").unwrap_or_default();
             out.push(RawApp {
                 display_icon,
@@ -321,6 +344,9 @@ fn read_registry_apps() -> Vec<RawApp> {
                     version,
                     publisher,
                     size: 0,
+                    installed,
+                    installed_approx,
+                    last_used: String::new(),
                     install_location: loc.trim().trim_matches('"').to_string(),
                 },
                 uninstall,
@@ -331,13 +357,119 @@ fn read_registry_apps() -> Vec<RawApp> {
     out
 }
 
+// Windows records when programs were launched from Start or Explorer (UserAssist, ROT13-encoded names).
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' => (((c as u8 - b'a' + 13) % 26) + b'a') as char,
+            'A'..='Z' => (((c as u8 - b'A' + 13) % 26) + b'A') as char,
+            _ => c,
+        })
+        .collect()
+}
+
+fn unix_to_date(secs: u64) -> String {
+    let z = (secs / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+fn userassist_entries() -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let hk = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(root) = hk.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist") else { return out };
+    for g in root.enum_keys().filter_map(|k| k.ok()) {
+        let Ok(cnt) = root.open_subkey(format!("{}\\Count", g)) else { continue };
+        for (name, val) in cnt.enum_values().filter_map(|v| v.ok()) {
+            let b: &[u8] = &val.bytes;
+            if b.len() < 68 {
+                continue;
+            }
+            let ft = u64::from_le_bytes(b[60..68].try_into().unwrap_or([0u8; 8]));
+            let secs = ft / 10_000_000;
+            if secs <= 11_644_473_600 {
+                continue;
+            }
+            out.push((rot13(&name).to_lowercase(), secs - 11_644_473_600));
+        }
+    }
+    out
+}
+
+/// App name without a trailing version, normalised (for example "Docker Desktop 4.2.1" becomes "dockerdesktop").
+fn app_key(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let mut end = words.len();
+    while end > 1
+        && words[end - 1].chars().any(|c| c.is_ascii_digit())
+        && words[end - 1].chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'v' || c == 'V')
+    {
+        end -= 1;
+    }
+    norm(&words[..end].join(" "))
+}
+
+fn last_used_for(app: &RawApp, ua: &[(String, u64)]) -> String {
+    // 1) launches of the program file itself
+    let by_exe = icon_source(app).and_then(|(exe, _)| {
+        if !exe.extension().map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false) {
+            return None;
+        }
+        let fname = name_of(&exe).to_lowercase();
+        let suffix = format!("\\{}", fname);
+        let hint = Path::new(&app.info.install_location)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        ua.iter()
+            .filter(|(p, _)| p.ends_with(&suffix) || *p == fname)
+            .filter(|(p, _)| hint.is_empty() || p.contains(hint.as_str()))
+            .map(|(_, t)| *t)
+            .max()
+    });
+    // 2) launches through a Start Menu shortcut named like the app
+    let key = app_key(&app.info.name);
+    let by_name = if key.len() >= 5 {
+        ua.iter()
+            .filter(|(p, _)| {
+                let stem = Path::new(p)
+                    .file_stem()
+                    .map(|s| norm(&s.to_string_lossy()))
+                    .unwrap_or_default();
+                stem.len() >= 5 && (stem == key || stem.contains(&key) || (stem.len() >= 8 && key.contains(&stem)))
+            })
+            .map(|(_, t)| *t)
+            .max()
+    } else {
+        None
+    };
+    by_exe
+        .into_iter()
+        .chain(by_name)
+        .max()
+        .map(unix_to_date)
+        .unwrap_or_default()
+}
 #[tauri::command]
 async fn list_apps() -> Result<Vec<AppInfo>, String> {
     let r = tauri::async_runtime::spawn_blocking(|| {
+        let ua = userassist_entries();
         let mut apps: Vec<AppInfo> = read_registry_apps()
             .into_par_iter()
             .map(|a| {
+                let used = last_used_for(&a, &ua);
                 let mut info = a.info;
+                info.last_used = used;
                 let est = a.est_kb * 1024;
                 let real = if !info.install_location.is_empty() && Path::new(&info.install_location).exists() {
                     dir_size(Path::new(&info.install_location))
@@ -536,7 +668,221 @@ async fn uninstall_app(name: String, version: String) -> Result<String, String> 
             .creation_flags(CREATE_NO_WINDOW)
             .status()
             .map_err(|e| format!("Couldn't start the uninstaller: {}", e))?;
+        let gone = !read_registry_apps().iter().any(|a| a.info.name == name);
+        if gone {
+            record_history("uninstall", format!("Uninstalled {}", name), 0, vec![]);
+        }
         Ok(format!("Uninstaller finished (exit code {})", status.code().unwrap_or(-1)))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    r
+}
+
+// ---------- saved data: protected folders and activity log ----------
+
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn data_dir() -> PathBuf {
+    let base = env_path("APPDATA").unwrap_or_else(std::env::temp_dir);
+    let d = base.join("Dustoff");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn norm_path(p: &Path) -> String {
+    let raw = p.to_string_lossy().to_string();
+    let mut s = raw.trim_start_matches(r"\\?\").replace('/', "\\").to_lowercase();
+    while s.ends_with('\\') {
+        s.pop();
+    }
+    s
+}
+
+fn load_protected() -> Vec<String> {
+    std::fs::read_to_string(data_dir().join("protected.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_protected(v: &Vec<String>) {
+    let _ = std::fs::write(
+        data_dir().join("protected.json"),
+        serde_json::to_string_pretty(v).unwrap_or_default(),
+    );
+}
+
+/// Returns the protected folder that conflicts with `p` (p is inside it, or p contains it).
+fn conflict_with(p: &Path, list: &[String]) -> Option<String> {
+    let target = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let t = format!("{}\\", norm_path(&target));
+    for pr in list {
+        let prp = PathBuf::from(pr);
+        let c = std::fs::canonicalize(&prp).unwrap_or(prp);
+        let q = format!("{}\\", norm_path(&c));
+        if t.starts_with(&q) || q.starts_with(&t) {
+            return Some(pr.clone());
+        }
+    }
+    None
+}
+
+fn protected_conflict(p: &Path) -> Option<String> {
+    conflict_with(p, &load_protected())
+}
+
+#[tauri::command]
+fn protected_list() -> Vec<String> {
+    load_protected()
+}
+
+#[tauri::command]
+fn protect_add(path: String) -> Result<Vec<String>, String> {
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let p = PathBuf::from(path.trim());
+    if !p.is_dir() {
+        return Err("That folder doesn't exist".into());
+    }
+    let canon = std::fs::canonicalize(&p).map_err(|e| e.to_string())?;
+    let s = canon.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+    let mut v = load_protected();
+    if !v.iter().any(|x| norm_path(Path::new(x)) == norm_path(Path::new(&s))) {
+        v.push(s);
+        v.sort();
+        save_protected(&v);
+    }
+    Ok(v)
+}
+
+#[tauri::command]
+fn protect_remove(path: String) -> Vec<String> {
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v = load_protected();
+    let want = norm_path(Path::new(&path));
+    v.retain(|x| norm_path(Path::new(x)) != want);
+    save_protected(&v);
+    v
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct HistItem {
+    path: String,
+    size: u64,
+    recycled: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct HistEntry {
+    id: u64,
+    ts: u64,
+    kind: String,
+    title: String,
+    freed: u64,
+    items: Vec<HistItem>,
+    undone: bool,
+}
+
+fn load_history() -> Vec<HistEntry> {
+    std::fs::read_to_string(data_dir().join("history.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_history(v: &Vec<HistEntry>) {
+    let _ = std::fs::write(
+        data_dir().join("history.json"),
+        serde_json::to_string(v).unwrap_or_default(),
+    );
+}
+
+fn record_history(kind: &str, title: String, freed: u64, mut items: Vec<HistItem>) {
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = load_history();
+    items.truncate(500);
+    h.push(HistEntry { id: now_millis(), ts: now_secs(), kind: kind.into(), title, freed, items, undone: false });
+    if h.len() > 300 {
+        let n = h.len() - 300;
+        h.drain(0..n);
+    }
+    save_history(&h);
+}
+
+#[tauri::command]
+fn list_history() -> Vec<HistEntry> {
+    let mut h = load_history();
+    h.reverse();
+    h
+}
+
+#[tauri::command]
+fn clear_history() {
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_history(&Vec::new());
+}
+
+#[derive(Serialize)]
+struct UndoFail {
+    path: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct UndoReport {
+    restored: usize,
+    failed: Vec<UndoFail>,
+}
+
+#[tauri::command]
+async fn undo_entry(id: u64) -> Result<UndoReport, String> {
+    let r = tauri::async_runtime::spawn_blocking(move || -> Result<UndoReport, String> {
+        use trash::os_limited::{list, restore_all};
+        let entry = load_history()
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| "That entry no longer exists".to_string())?;
+        if entry.undone {
+            return Err("This was already restored".into());
+        }
+        let bin = list().map_err(|e| format!("Couldn't read the Recycle Bin: {}", e))?;
+        let mut restored = 0usize;
+        let mut failed: Vec<UndoFail> = Vec::new();
+        for it in entry.items.iter().filter(|i| i.recycled) {
+            let want = norm_path(Path::new(&it.path));
+            let mut cands: Vec<&trash::TrashItem> = bin
+                .iter()
+                .filter(|ti| norm_path(&ti.original_parent.join(&ti.name)) == want)
+                .collect();
+            cands.sort_by_key(|ti| std::cmp::Reverse(ti.time_deleted));
+            match cands.first() {
+                None => failed.push(UndoFail {
+                    path: it.path.clone(),
+                    error: "It's no longer in the Recycle Bin (emptied or already restored)".into(),
+                }),
+                Some(ti) => match restore_all(vec![(*ti).clone()]) {
+                    Ok(()) => restored += 1,
+                    Err(e) => failed.push(UndoFail { path: it.path.clone(), error: format!("{}", e) }),
+                },
+            }
+        }
+        if failed.is_empty() && restored > 0 {
+            let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut h = load_history();
+            if let Some(e) = h.iter_mut().find(|e| e.id == id) {
+                e.undone = true;
+            }
+            save_history(&h);
+        }
+        Ok(UndoReport { restored, failed })
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -567,6 +913,9 @@ fn allowed_roots() -> Vec<PathBuf> {
 
 fn check_deletable(p: &Path) -> Result<PathBuf, String> {
     let canon = std::fs::canonicalize(p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    if let Some(pr) = protected_conflict(p) {
+        return Err(format!("{} is inside a folder you protected ({})", p.display(), pr));
+    }
     for root in allowed_roots() {
         let Ok(rc) = std::fs::canonicalize(&root) else { continue };
         if canon == rc {
@@ -673,33 +1022,64 @@ struct DeleteResult {
     freed: u64,
 }
 
+#[derive(Serialize, Clone)]
+struct Progress {
+    label: String,
+    done: usize,
+    total: usize,
+    freed: u64,
+}
+
+fn emit_progress(app: &tauri::AppHandle, label: &str, done: usize, total: usize, freed: u64) {
+    let _ = app.emit("task-progress", Progress { label: label.to_string(), done, total, freed });
+}
+
 #[tauri::command]
-async fn delete_paths(paths: Vec<String>, permanent: bool) -> Result<Vec<DeleteResult>, String> {
+async fn delete_paths(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+    permanent: bool,
+    title: Option<String>,
+) -> Result<Vec<DeleteResult>, String> {
     let r = tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|s| {
-                let p = PathBuf::from(&s);
-                let canon = match check_deletable(&p) {
-                    Ok(c) => c,
-                    Err(e) => return DeleteResult { path: s, ok: false, error: Some(e), freed: 0 },
-                };
-                let size = dir_size(&p);
-                let res: Result<(), String> = if permanent {
-                    if canon.is_dir() {
-                        std::fs::remove_dir_all(&p).map_err(|e| e.to_string())
+        let total = paths.len();
+        let mut results: Vec<DeleteResult> = Vec::new();
+        let mut freed_total = 0u64;
+        for (i, s) in paths.into_iter().enumerate() {
+            emit_progress(&app, &s, i, total, freed_total);
+            let p = PathBuf::from(&s);
+            let res = match check_deletable(&p) {
+                Err(e) => DeleteResult { path: s, ok: false, error: Some(e), freed: 0 },
+                Ok(canon) => {
+                    let size = dir_size(&p);
+                    let outcome: Result<(), String> = if permanent {
+                        if canon.is_dir() {
+                            std::fs::remove_dir_all(&p).map_err(|e| e.to_string())
+                        } else {
+                            std::fs::remove_file(&p).map_err(|e| e.to_string())
+                        }
                     } else {
-                        std::fs::remove_file(&p).map_err(|e| e.to_string())
+                        trash::delete(&p).map_err(|e| e.to_string())
+                    };
+                    match outcome {
+                        Ok(()) => DeleteResult { path: s, ok: true, error: None, freed: size },
+                        Err(e) => DeleteResult { path: s, ok: false, error: Some(e), freed: 0 },
                     }
-                } else {
-                    trash::delete(&p).map_err(|e| e.to_string())
-                };
-                match res {
-                    Ok(()) => DeleteResult { path: s, ok: true, error: None, freed: size },
-                    Err(e) => DeleteResult { path: s, ok: false, error: Some(e), freed: 0 },
                 }
-            })
-            .collect::<Vec<_>>()
+            };
+            freed_total += res.freed;
+            results.push(res);
+        }
+        emit_progress(&app, "Done", total, total, freed_total);
+        let items: Vec<HistItem> = results
+            .iter()
+            .filter(|r| r.ok)
+            .map(|r| HistItem { path: r.path.clone(), size: r.freed, recycled: !permanent })
+            .collect();
+        if !items.is_empty() {
+            record_history("remove", title.unwrap_or_else(|| "Removed folders".into()), freed_total, items);
+        }
+        results
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -707,6 +1087,7 @@ async fn delete_paths(paths: Vec<String>, permanent: bool) -> Result<Vec<DeleteR
 }
 
 // ---------- large files and duplicates ----------
+
 
 #[derive(Serialize)]
 struct FileHit {
@@ -853,6 +1234,9 @@ fn cancel_files_scan() {
 fn check_trashable_file(p: &Path) -> Result<PathBuf, String> {
     let canon = std::fs::canonicalize(p).map_err(|e| format!("{}: {}", p.display(), e))?;
     let md = std::fs::metadata(&canon).map_err(|e| e.to_string())?;
+    if let Some(pr) = protected_conflict(p) {
+        return Err(format!("{} is inside a folder you protected ({})", p.display(), pr));
+    }
     if !md.is_file() {
         return Err("Only files can be removed from here".into());
     }
@@ -876,22 +1260,36 @@ fn check_trashable_file(p: &Path) -> Result<PathBuf, String> {
 
 /// Moves files to the Recycle Bin only (recoverable).
 #[tauri::command]
-async fn trash_files(paths: Vec<String>) -> Result<Vec<DeleteResult>, String> {
+async fn trash_files(app: tauri::AppHandle, paths: Vec<String>, title: Option<String>) -> Result<Vec<DeleteResult>, String> {
     let r = tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|s| {
-                let p = PathBuf::from(&s);
-                if let Err(e) = check_trashable_file(&p) {
-                    return DeleteResult { path: s, ok: false, error: Some(e), freed: 0 };
-                }
+        let total = paths.len();
+        let mut results: Vec<DeleteResult> = Vec::new();
+        let mut freed_total = 0u64;
+        for (i, s) in paths.into_iter().enumerate() {
+            emit_progress(&app, &s, i, total, freed_total);
+            let p = PathBuf::from(&s);
+            let res = if let Err(e) = check_trashable_file(&p) {
+                DeleteResult { path: s, ok: false, error: Some(e), freed: 0 }
+            } else {
                 let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                 match trash::delete(&p) {
                     Ok(()) => DeleteResult { path: s, ok: true, error: None, freed: size },
                     Err(e) => DeleteResult { path: s, ok: false, error: Some(e.to_string()), freed: 0 },
                 }
-            })
-            .collect::<Vec<_>>()
+            };
+            freed_total += res.freed;
+            results.push(res);
+        }
+        emit_progress(&app, "Done", total, total, freed_total);
+        let items: Vec<HistItem> = results
+            .iter()
+            .filter(|r| r.ok)
+            .map(|r| HistItem { path: r.path.clone(), size: r.freed, recycled: true })
+            .collect();
+        if !items.is_empty() {
+            record_history("files", title.unwrap_or_else(|| "Files moved to the Recycle Bin".into()), freed_total, items);
+        }
+        results
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -899,6 +1297,7 @@ async fn trash_files(paths: Vec<String>) -> Result<Vec<DeleteResult>, String> {
 }
 
 // ---------- caches ----------
+
 
 #[derive(Clone, Copy, PartialEq)]
 enum CacheKind {
@@ -1082,36 +1481,87 @@ async fn cache_targets() -> Result<Vec<CacheTarget>, String> {
 }
 
 #[derive(Serialize)]
-struct CleanReport {
+struct CleanDetail {
+    id: String,
+    label: String,
     freed: u64,
     skipped: usize,
 }
 
+#[derive(Serialize)]
+struct CleanReport {
+    freed: u64,
+    skipped: usize,
+    details: Vec<CleanDetail>,
+}
+
 #[tauri::command]
-async fn clean_cache(ids: Vec<String>) -> Result<CleanReport, String> {
+async fn clean_cache(app: tauri::AppHandle, ids: Vec<String>, title: Option<String>) -> Result<CleanReport, String> {
     let r = tauri::async_runtime::spawn_blocking(move || {
+        let protected = load_protected();
+        let plans: Vec<(CacheDef, Vec<PathBuf>)> = cache_defs()
+            .into_iter()
+            .filter(|d| ids.iter().any(|i| i == d.id))
+            .map(|d| {
+                let entries = if d.kind == CacheKind::RecycleBin { Vec::new() } else { cache_entries(&d) };
+                (d, entries)
+            })
+            .collect();
+        let total: usize = plans
+            .iter()
+            .map(|(d, e)| if d.kind == CacheKind::RecycleBin { 1 } else { e.len().max(1) })
+            .sum();
+        let mut done = 0usize;
         let mut freed = 0u64;
         let mut skipped = 0usize;
-        for def in cache_defs().into_iter().filter(|d| ids.iter().any(|i| i == d.id)) {
+        let mut details: Vec<CleanDetail> = Vec::new();
+        let mut last = Instant::now() - Duration::from_secs(1);
+
+        for (def, entries) in plans {
+            let mut d_freed = 0u64;
+            let mut d_skipped = 0usize;
+            emit_progress(&app, def.label, done, total, freed);
             if def.kind == CacheKind::RecycleBin {
                 let size = recycle_bin_size();
                 if empty_recycle_bin() {
-                    freed += size;
+                    d_freed = size;
                 } else {
-                    skipped += 1;
+                    d_skipped = 1;
                 }
-                continue;
-            }
-            for child in cache_entries(&def) {
-                let size = dir_size(&child);
-                let res = if child.is_dir() { std::fs::remove_dir_all(&child) } else { std::fs::remove_file(&child) };
-                match res {
-                    Ok(()) => freed += size,
-                    Err(_) => skipped += 1,
+                done += 1;
+            } else {
+                if entries.is_empty() {
+                    done += 1;
+                }
+                for child in entries {
+                    if conflict_with(&child, &protected).is_some() {
+                        d_skipped += 1;
+                        done += 1;
+                        continue;
+                    }
+                    let size = dir_size(&child);
+                    let res = if child.is_dir() { std::fs::remove_dir_all(&child) } else { std::fs::remove_file(&child) };
+                    match res {
+                        Ok(()) => d_freed += size,
+                        Err(_) => d_skipped += 1,
+                    }
+                    done += 1;
+                    if last.elapsed() >= Duration::from_millis(80) {
+                        emit_progress(&app, def.label, done, total, freed + d_freed);
+                        last = Instant::now();
+                    }
                 }
             }
+            freed += d_freed;
+            skipped += d_skipped;
+            details.push(CleanDetail { id: def.id.into(), label: def.label.into(), freed: d_freed, skipped: d_skipped });
+            emit_progress(&app, def.label, done, total, freed);
         }
-        CleanReport { freed, skipped }
+        emit_progress(&app, "Done", total, total, freed);
+        if freed > 0 {
+            record_history("cache", title.unwrap_or_else(|| "Cache cleanup".into()), freed, Vec::new());
+        }
+        CleanReport { freed, skipped, details }
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -1137,8 +1587,67 @@ pub fn run() {
             cancel_files_scan,
             trash_files,
             cache_targets,
-            clean_cache
+            clean_cache,
+            protected_list,
+            protect_add,
+            protect_remove,
+            list_history,
+            clear_history,
+            undo_entry
         ])
         .run(tauri::generate_context!())
         .expect("error while running Dustoff");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_convert_correctly() {
+        assert_eq!(unix_to_date(0), "1970-01-01");
+        assert_eq!(unix_to_date(1_700_000_000), "2023-11-14");
+        assert_eq!(unix_to_date(1_709_164_800), "2024-02-29");
+    }
+
+    #[test]
+    fn rot13_decodes_userassist_names() {
+        assert_eq!(rot13("Pbqr"), "Code");
+        assert_eq!(rot13(&rot13("C:\\Program Files\\App\\app.exe")), "C:\\Program Files\\App\\app.exe");
+    }
+
+    #[test]
+    fn protected_folders_block_children_and_parents_but_not_lookalikes() {
+        let base = std::env::temp_dir().join(format!("dustoff_test_{}", now_millis()));
+        let protected = base.join("keep");
+        let inside = protected.join("sub");
+        let lookalike = base.join("keep_other");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&lookalike).unwrap();
+        let list = vec![protected.to_string_lossy().to_string()];
+
+        assert!(conflict_with(&inside, &list).is_some(), "child of a protected folder must be blocked");
+        assert!(conflict_with(&protected, &list).is_some(), "the protected folder itself must be blocked");
+        assert!(conflict_with(&base, &list).is_some(), "a parent that contains a protected folder must be blocked");
+        assert!(conflict_with(&lookalike, &list).is_none(), "a folder that only shares a name prefix must be allowed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn real_machine_apps_have_dates() {
+        let ua = userassist_entries();
+        let apps = read_registry_apps();
+        let with_install = apps.iter().filter(|a| !a.info.installed.is_empty()).count();
+        let with_used = apps.iter().filter(|a| !last_used_for(a, &ua).is_empty()).count();
+        println!("apps: {}, with install date: {}, with last-used: {}, userassist entries: {}", apps.len(), with_install, with_used, ua.len());
+        for a in apps.iter().take(8) {
+            println!("  {} | installed {} ({}) | last used {}", a.info.name, a.info.installed, if a.info.installed_approx { "approx" } else { "exact" }, last_used_for(a, &ua));
+        }
+        assert!(!apps.is_empty());
+    }
+
+    #[test]
+    fn norm_path_ignores_case_slashes_and_verbatim_prefix() {
+        assert_eq!(norm_path(Path::new(r"\\?\C:\Users\Test\")), norm_path(Path::new("c:/users/test")));
+    }
 }

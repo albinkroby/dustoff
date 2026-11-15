@@ -16,6 +16,7 @@
         <button class="nav" data-page="storage">Storage</button>
         <button class="nav" data-page="files">Files</button>
         <button class="nav" data-page="cleanup">Cleanup</button>
+        <button class="nav" data-page="safety">Safety</button>
       </nav>
       <button class="btn theme-btn" id="theme-btn" title="Switch theme">Theme: system</button>
       <p class="side-note">Nothing is deleted without a preview and your confirmation.</p>
@@ -23,7 +24,7 @@
 
     <main class="main">
       <section id="page-dashboard" class="page">
-        <div class="head"><h1>Dashboard</h1><button class="btn" id="refresh-dash">Refresh</button></div>
+        <div class="head"><h1>Dashboard</h1><button class="btn" id="refresh-dash" data-icon="refresh">Refresh</button></div>
         <div id="drive-chips" class="chips"></div>
         <div class="grid2">
           <div class="card ringcard">
@@ -41,7 +42,10 @@
           <div class="card soft">
             <div class="soft-label">Reclaimable cache space</div>
             <div class="big soft-big" id="reclaim">--</div>
-            <button class="btn primary" id="go-cleanup">Review and clean</button>
+            <div class="btnrow">
+              <button class="btn primary" id="smart-clean">Smart clean</button>
+              <button class="btn" id="go-cleanup">Review items</button>
+            </div>
           </div>
         </div>
         <div class="card list">
@@ -51,12 +55,17 @@
       </section>
 
       <section id="page-apps" class="page hidden">
-        <div class="head"><h1>Apps</h1><button class="btn" id="refresh-apps">Refresh</button></div>
+        <div class="head"><h1>Apps</h1><button class="btn" id="refresh-apps" data-icon="refresh">Refresh</button></div>
         <div class="toolbar">
-          <input id="app-search" class="search" type="search" placeholder="Search installed apps" />
-          <select id="app-sort" class="select" aria-label="Sort apps">
+          <div class="search-wrap">
+            <span class="search-ic" data-icon="search" data-bare="1"></span>
+            <input id="app-search" class="search" type="search" placeholder="Search installed apps" />
+          </div>
+          <select id="app-sort" aria-label="Sort apps">
             <option value="size">Largest first</option>
             <option value="name">Name A to Z</option>
+            <option value="installed">Oldest installed</option>
+            <option value="used">Least recently used</option>
           </select>
         </div>
         <div id="app-count" class="small muted count"></div>
@@ -66,18 +75,21 @@
       <section id="page-storage" class="page hidden">
         <div class="head"><h1>Storage</h1>
           <div class="seg" role="group" aria-label="View">
-            <button class="seg-btn on" id="view-list">List</button>
-            <button class="seg-btn" id="view-tree">Treemap</button>
+            <button class="seg-btn on" id="view-list" data-icon="list">List</button>
+            <button class="seg-btn" id="view-tree" data-icon="treemap">Treemap</button>
           </div>
         </div>
-        <div class="pathbar">
-          <button class="btn icon" id="st-back" title="Back" aria-label="Back">&larr;</button>
-          <button class="btn icon" id="st-fwd" title="Forward" aria-label="Forward">&rarr;</button>
-          <button class="btn icon" id="st-up" title="Up one level" aria-label="Up one level">&uarr;</button>
-          <select id="st-drive" class="select" aria-label="Drive"></select>
-          <input id="st-path" class="search pathinput" type="text" spellcheck="false" aria-label="Folder path" />
-          <button class="btn" id="st-go">Go</button>
-          <button class="btn" id="st-refresh">Refresh</button>
+        <div class="pathrow">
+          <div class="addr">
+            <button class="ibtn" id="st-back" title="Back" aria-label="Back" data-icon="back" data-bare="1"></button>
+            <button class="ibtn" id="st-fwd" title="Forward" aria-label="Forward" data-icon="forward" data-bare="1"></button>
+            <button class="ibtn" id="st-up" title="Up one level" aria-label="Up one level" data-icon="up" data-bare="1"></button>
+            <span class="addr-sep"></span>
+            <select id="st-drive" aria-label="Drive"></select>
+            <input id="st-path" class="pathinput" type="text" spellcheck="false" aria-label="Folder path" />
+            <button class="ibtn go" id="st-go" title="Go to this folder" aria-label="Go" data-icon="forward" data-bare="1"></button>
+          </div>
+          <button class="btn" id="st-refresh" data-icon="refresh">Refresh</button>
         </div>
         <div id="st-status" class="small muted count"></div>
         <div class="card list" id="st-card"><div id="st-list"></div></div>
@@ -86,35 +98,53 @@
       <section id="page-files" class="page hidden">
         <div class="head"><h1>Files</h1></div>
         <div class="seg" role="group" aria-label="Mode" style="margin-bottom:12px">
-          <button class="seg-btn on" id="mode-large">Large files</button>
-          <button class="seg-btn" id="mode-dups">Duplicates</button>
+          <button class="seg-btn on" id="mode-large" data-icon="file">Large files</button>
+          <button class="seg-btn" id="mode-dups" data-icon="copy">Duplicates</button>
         </div>
         <div class="toolbar wrap">
-          <select id="fl-scope" class="select" aria-label="Where to look"></select>
+          <select id="fl-scope" aria-label="Where to look"></select>
           <input id="fl-custom" class="search hidden" type="text" spellcheck="false" placeholder="C:\path\to\folder" />
-          <select id="fl-min" class="select" aria-label="Minimum size"></select>
-          <button class="btn primary" id="fl-scan">Scan</button>
+          <select id="fl-min" aria-label="Minimum size"></select>
+          <button class="btn primary" id="fl-scan" data-icon="search">Scan</button>
           <button class="btn hidden" id="fl-cancel">Cancel</button>
         </div>
         <div id="fl-status" class="small muted count"></div>
         <div id="fl-results"></div>
         <div class="actions hidden" id="fl-actions">
           <button class="btn" id="fl-auto">Select extra copies</button>
-          <button class="btn danger" id="fl-trash">Move selected to Recycle Bin</button>
+          <button class="btn danger" id="fl-trash" data-icon="trash">Move selected to Recycle Bin</button>
         </div>
       </section>
 
       <section id="page-cleanup" class="page hidden">
-        <div class="head"><h1>Cleanup</h1><button class="btn" id="refresh-cleanup">Refresh</button></div>
+        <div class="head"><h1>Cleanup</h1><button class="btn" id="refresh-cleanup" data-icon="refresh">Refresh</button></div>
         <p class="muted">Caches that apps rebuild automatically. Safe items are ticked. Browser, app and Recycle Bin items start unticked so you choose them yourself. Files in use are skipped.</p>
         <div class="card list"><div id="cache-list" class="muted pad">Loading…</div></div>
         <div class="actions"><button class="btn primary" id="clean-btn">Clean selected</button></div>
+      </section>
+      <section id="page-safety" class="page hidden">
+        <div class="head"><h1>Safety</h1><button class="btn" id="refresh-safety" data-icon="refresh">Refresh</button></div>
+        <div class="card list sec">
+          <div class="card-title">Protected folders</div>
+          <p class="small muted">Dustoff will never delete, move or clean anything inside these folders, or any folder that contains them. You can also right-click a folder in Storage.</p>
+          <div class="addrow">
+            <input id="prot-path" class="search" type="text" spellcheck="false" placeholder="C:\path\to\folder" />
+            <button class="btn primary" id="prot-add">Protect folder</button>
+          </div>
+          <div id="prot-list"></div>
+        </div>
+        <div class="card list sec">
+          <div class="card-title head"><span>Activity log</span><button class="btn" id="hist-clear">Clear log</button></div>
+          <p class="small muted">Everything Dustoff removed. Items moved to the Recycle Bin can be restored while they are still there.</p>
+          <div id="hist-list"></div>
+        </div>
       </section>
     </main>
   </div>
 
   <div id="modal" class="overlay hidden"><div class="modal" id="modal-box"></div></div>
-  <div id="toast" class="toast hidden"></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="ctx" class="ctx hidden" role="menu"></div>
   <script src="main.js"></script>
 </body>
 </html>

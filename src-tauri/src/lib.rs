@@ -741,7 +741,7 @@ async fn remove_broken_entry(name: String, version: String) -> Result<(), String
             .open_subkey_with_flags(UNINSTALL_KEYS[app.hive as usize], KEY_ALL_ACCESS)
             .map_err(registry_error)?;
         parent.delete_subkey_all(&app.key_name).map_err(registry_error)?;
-        record_history("uninstall", format!("Removed broken entry for {}", name), 0, vec![]);
+        record_history("entry", format!("Removed broken entry for {}", name), 0, vec![]);
         Ok(())
     })
     .await

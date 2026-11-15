@@ -255,6 +255,8 @@ function menuFor(target) {
       { label: "Copy path", icon: "copy", run: () => copyText(it.path) },
       it.is_dir && "-",
       it.is_dir && { label: "Never touch this folder", icon: "shield", run: () => protect(it.path) },
+      "-",
+      { label: "Move to Recycle Bin…", icon: "trash", danger: true, run: () => confirmRemoveItem(it) },
     ].filter(Boolean);
   }
   const ap = target.closest("#apps-list [data-ai]");
@@ -576,6 +578,36 @@ function reviewLeftovers(app, left) {
       reportRemoval("folder", res, perm ? "freed" : "moved to the Recycle Bin");
       loadDrives(); refreshSafetyIfOpen();
     } catch (e) { closeModal(); toast.error("Couldn't remove leftovers", errText(e)); }
+  };
+}
+
+// Move a folder or file from the Storage page to the Recycle Bin (only inside the folders Dustoff is allowed to clean).
+function confirmRemoveItem(it) {
+  const kind = it.is_dir ? "folder" : "file";
+  modal(`<h2>Move this ${kind} to the Recycle Bin?</h2>
+    <p class="p" style="margin:4px 0 8px;word-break:break-all"><b>${esc(it.name)}</b><br><span class="muted">${esc(it.path)} · ${fmt(it.size)}</span></p>
+    ${/\\program files/i.test(it.path) ? '<p class="small" style="color:var(--warn);margin:0 0 8px">This is inside Program Files. Removing an installed program\'s folder this way can break it. Uninstalling it from the Apps page is safer.</p>' : ""}
+    <p class="muted">You can restore it from the Recycle Bin, or from Safety → Activity log. Windows folders, shared publisher folders and folders you protected can't be removed, and Dustoff will tell you if this one is blocked.</p>
+    <div class="btns"><button class="btn" id="m-cancel">Cancel</button><button class="btn danger" id="m-go">Move to Recycle Bin</button></div>`);
+  $("#m-cancel").onclick = closeModal;
+  $("#m-go").onclick = async () => {
+    openProgress(`Moving ${it.name} to the Recycle Bin`, it.path);
+    try {
+      const title = `Removed ${it.name} from Storage`;
+      let res = await invoke("delete_paths", { paths: [it.path], permanent: false, title });
+      // files outside AppData/Program Files (for example in Documents) go through the file mover instead
+      if (!it.is_dir && res[0] && !res[0].ok && /outside the folders/.test(res[0].error || "")) {
+        res = await invoke("trash_files", { paths: [it.path], title });
+      }
+      closeModal();
+      const { ok } = reportRemoval(kind, res, "moved to the Recycle Bin");
+      if (ok.length) {
+        scanCache.delete(cur.path);
+        go(cur.path, false, true);
+        loadDrives();
+        refreshSafetyIfOpen();
+      }
+    } catch (e) { closeModal(); toast.error("Couldn't move it to the Recycle Bin", errText(e)); }
   };
 }
 
@@ -974,7 +1006,7 @@ $("#prot-list").addEventListener("click", async (e) => {
   catch (err) { toast.error("Couldn't update the list", errText(err)); }
 });
 
-const HIST_ICON = { remove: "trash", files: "file", cache: "refresh", uninstall: "uninstall" };
+const HIST_ICON = { remove: "trash", files: "file", cache: "refresh", uninstall: "uninstall", entry: "uninstall" };
 async function renderHistory() {
   try {
     const h = await invoke("list_history");
@@ -982,9 +1014,12 @@ async function renderHistory() {
     $("#hist-list").innerHTML = h.length ? h.map((e, i) => {
       const when = new Date(e.ts * 1000).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
       const recycled = e.items.filter((x) => x.recycled).length;
-      const detail = e.kind === "uninstall" ? "Uninstalled"
+      const entryRemoved = e.kind === "entry" || e.title.startsWith("Removed broken entry");
+      const detail = entryRemoved ? "Removed from Windows' list of installed apps"
+        : e.kind === "uninstall" ? "Uninstalled with the app's own uninstaller"
         : `${fmt(e.freed)}${recycled ? ` · ${plural(recycled, "item", "items")} in the Recycle Bin` : " · permanently removed"}`;
-      const badge = e.undone ? '<span class="badge">Restored</span>' : "";
+      const badge = e.undone ? '<span class="badge">Restored</span>'
+        : !recycled ? '<span class="badge off" title="This was permanent or isn\'t a file, so there is nothing in the Recycle Bin to bring back. Reinstall the app to get it back.">Can\'t be restored</span>' : "";
       const btn = recycled && !e.undone ? `<button class="btn small-btn" data-undo="${i}">Restore</button>` : "";
       return `<div class="row"><div class="avatar sh">${svg(HIST_ICON[e.kind] || "info", 18)}</div><div class="grow"><div class="title">${esc(e.title)}</div><div class="small muted">${esc(when)} · ${esc(detail)}</div></div>${badge}${btn}</div>`;
     }).join("") : '<div class="muted pad small">Nothing has been removed yet.</div>';

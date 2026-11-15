@@ -219,6 +219,7 @@ h1{font-size:22px;font-weight:600;margin:0 0 16px}
 .addrow .search{flex:1}
 .avatar.sh{background:var(--seg-bg);color:var(--muted)}
 .badge.warn{background:var(--warn-bg);color:var(--warn)}
+.badge.off{background:var(--seg-bg);color:var(--muted)}
 .title .badge{margin-left:6px;vertical-align:1px}
 .badge{font-size:12px;padding:2px 9px;border-radius:999px;background:var(--ok-bg);color:var(--ok);white-space:nowrap}
 

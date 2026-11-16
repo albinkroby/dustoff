@@ -6,17 +6,21 @@ Built with [Tauri 2](https://tauri.app) (Rust backend, plain HTML/CSS/JavaScript
 
 ## Features
 
-- **Dashboard** with free space for every drive, and a warning when a drive is almost full.
-- **Storage** browser with list and treemap views, an editable path bar, back/forward/up navigation, and live parallel scanning.
-- **Apps**: installed programs with real icons and sizes. "Uninstall + clean" runs the app's own uninstaller, then offers leftover folders for review. Removed folders go to the Recycle Bin unless you choose permanent deletion.
+- **Dashboard** with free space for every drive, one-click **Smart clean** (safe items only, with a preview), and a warning banner when a drive is almost full. While the app is open it rechecks your drives every few minutes and can send a Windows notification when a drive gets fuller than your chosen level.
+- **Storage** browser with list and treemap views, an editable path bar, back/forward/up navigation, live parallel scanning, and a right-click menu (open, show in Explorer, copy path, protect, move to the Recycle Bin).
+- **Apps**: installed programs with real icons, sizes, install dates and last-used dates. "Uninstall + clean" runs the app's own uninstaller, then offers leftover folders for review. Apps whose uninstaller is already gone are flagged as broken entries and can be removed from Windows' list.
 - **Files**: large file finder and exact duplicate finder (matched by content hash). Files go to the Recycle Bin only, and every copy in a group cannot be removed at once.
-- **Cleanup**: temp files, thumbnail and shader caches, error reports, npm and pip caches, plus optional browser, Discord and VS Code caches and the Recycle Bin.
+- **Cleanup**: temp files, thumbnail and shader caches, error reports, npm and pip caches, plus optional browser, Discord and VS Code caches and the Recycle Bin, with a progress bar.
+- **Safety**: protected folders Dustoff will never touch, and an activity log of everything it removed, with one-click restore for items in the Recycle Bin.
+- **Settings**: theme, start page, default view, cleaning preferences and the nearly-full warning level. Settings, protected folders and the log are stored in `%APPDATA%\Dustoff`.
 - Light and dark themes.
 
 ## Safety
 
 - Every deletion shows a preview and asks for confirmation.
 - Deleting app data is limited to an allow-list of locations (AppData, ProgramData, Program Files, Downloads) and blocks Windows folders and shared publisher folders.
+- Folders you protect are never deleted, moved or cleaned, and neither is any folder that contains them.
+- Recycle Bin removals are recorded and can be restored from the activity log. Permanent removals (such as caches) are clearly marked as not restorable.
 - The frontend never passes arbitrary commands to the backend. Uninstallers are looked up by name from the Windows registry.
 
 ## Build from source

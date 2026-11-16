@@ -1,6 +1,6 @@
 [package]
 name = "dustoff"
-version = "0.2.0"
+version = "0.2.1"
 description = "Dustoff: see what uses your disk, uninstall apps and clean their data"
 edition = "2021"
 

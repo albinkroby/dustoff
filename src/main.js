@@ -1077,11 +1077,6 @@ $("#set-warn").addEventListener("change", (e) => {
  
 });
 $("#set-notify").addEventListener("change", (e) => { settings.notify = e.target.checked; saveSettings(); });
-$("#set-test").onclick = async () => {
-  const r = await sendNotification("Dustoff test", "Notifications are working. You'll get one like this when a drive is nearly full.");
-  // On success the Windows popup is the confirmation, so nothing is shown inside the app.
-  if (!r.ok) toast.error("Windows didn't show the notification", r.error);
-};
 document.querySelectorAll("#theme-seg .seg-btn").forEach((b) => b.addEventListener("click", () => { applyTheme(b.dataset.theme); }));
 $("#set-open").onclick = async () => { try { await invoke("open_data_folder"); } catch (e) { toast.error("Couldn't open the folder", errText(e)); } };
 $("#set-reset").onclick = () => {

@@ -7,10 +7,10 @@ use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use winreg::enums::*;
 use winreg::RegKey;
 
@@ -51,6 +51,11 @@ fn name_of(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Runs `f` and turns a panic into `None`, so one malformed entry cannot break a whole list.
+fn safely<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
 }
 
 fn norm(s: &str) -> String {
@@ -318,6 +323,67 @@ fn is_broken(uninstall: &str) -> bool {
     }
 }
 
+/// Reads one Uninstall registry entry. Returns None for entries that aren't real, listed apps.
+fn parse_entry(k: &RegKey, name_key: &str, hive_idx: usize) -> Option<RawApp> {
+    let name: String = k.get_value("DisplayName").unwrap_or_default();
+    if name.trim().is_empty() {
+        return None;
+    }
+    let system: u32 = k.get_value("SystemComponent").unwrap_or(0);
+    if system == 1 {
+        return None;
+    }
+    let parent: String = k.get_value("ParentKeyName").unwrap_or_default();
+    if !parent.is_empty() {
+        return None;
+    }
+    let uninstall: String = k.get_value("UninstallString").unwrap_or_default();
+    if uninstall.trim().is_empty() {
+        return None;
+    }
+    let version: String = k.get_value("DisplayVersion").unwrap_or_default();
+    let publisher: String = k.get_value("Publisher").unwrap_or_default();
+    let est: u32 = k.get_value("EstimatedSize").unwrap_or(0);
+    let loc: String = k.get_value("InstallLocation").unwrap_or_default();
+    let inst_raw: String = k.get_value("InstallDate").unwrap_or_else(|_| {
+        k.get_value::<u32, _>("InstallDate").map(|v| v.to_string()).unwrap_or_default()
+    });
+    let mut installed = if inst_raw.len() == 8 && inst_raw.chars().all(|c| c.is_ascii_digit()) {
+        format!("{}-{}-{}", &inst_raw[0..4], &inst_raw[4..6], &inst_raw[6..8])
+    } else {
+        String::new()
+    };
+    let mut installed_approx = false;
+    if installed.is_empty() {
+        if let Ok(meta) = k.query_info() {
+            let t = meta.get_last_write_time_system();
+            if t.wYear > 1990 {
+                installed = format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay);
+                installed_approx = true;
+            }
+        }
+    }
+    let display_icon: String = k.get_value("DisplayIcon").unwrap_or_default();
+    Some(RawApp {
+        display_icon,
+        hive: hive_idx as u8,
+        key_name: name_key.to_string(),
+        info: AppInfo {
+            name,
+            version,
+            publisher,
+            size: 0,
+            installed,
+            installed_approx,
+            last_used: String::new(),
+            broken: is_broken(&uninstall),
+            install_location: loc.trim().trim_matches('"').to_string(),
+        },
+        uninstall,
+        est_kb: est as u64,
+    })
+}
+
 fn read_registry_apps() -> Vec<RawApp> {
     let sub = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
     let sub32 = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
@@ -332,66 +398,12 @@ fn read_registry_apps() -> Vec<RawApp> {
         let Ok(key) = hive.open_subkey(path) else { continue };
         for name_key in key.enum_keys().filter_map(|k| k.ok()) {
             let Ok(k) = key.open_subkey(&name_key) else { continue };
-            let name: String = k.get_value("DisplayName").unwrap_or_default();
-            if name.trim().is_empty() {
+            // One malformed entry must never take the whole list down: a panic here just skips it.
+            let Some(Some(app)) = safely(|| parse_entry(&k, &name_key, hive_idx)) else { continue };
+            if !seen.insert((app.info.name.clone(), app.info.version.clone())) {
                 continue;
             }
-            let system: u32 = k.get_value("SystemComponent").unwrap_or(0);
-            if system == 1 {
-                continue;
-            }
-            let parent: String = k.get_value("ParentKeyName").unwrap_or_default();
-            if !parent.is_empty() {
-                continue;
-            }
-            let uninstall: String = k.get_value("UninstallString").unwrap_or_default();
-            if uninstall.trim().is_empty() {
-                continue;
-            }
-            let version: String = k.get_value("DisplayVersion").unwrap_or_default();
-            if !seen.insert((name.clone(), version.clone())) {
-                continue;
-            }
-            let publisher: String = k.get_value("Publisher").unwrap_or_default();
-            let est: u32 = k.get_value("EstimatedSize").unwrap_or(0);
-            let loc: String = k.get_value("InstallLocation").unwrap_or_default();
-            let inst_raw: String = k.get_value("InstallDate").unwrap_or_else(|_| {
-                k.get_value::<u32, _>("InstallDate").map(|v| v.to_string()).unwrap_or_default()
-            });
-            let mut installed = if inst_raw.len() == 8 && inst_raw.chars().all(|c| c.is_ascii_digit()) {
-                format!("{}-{}-{}", &inst_raw[0..4], &inst_raw[4..6], &inst_raw[6..8])
-            } else {
-                String::new()
-            };
-            let mut installed_approx = false;
-            if installed.is_empty() {
-                if let Ok(meta) = k.query_info() {
-                    let t = meta.get_last_write_time_system();
-                    if t.wYear > 1990 {
-                        installed = format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay);
-                        installed_approx = true;
-                    }
-                }
-            }
-            let display_icon: String = k.get_value("DisplayIcon").unwrap_or_default();
-            out.push(RawApp {
-                display_icon,
-                hive: hive_idx as u8,
-                key_name: name_key.clone(),
-                info: AppInfo {
-                    name,
-                    version,
-                    publisher,
-                    size: 0,
-                    installed,
-                    installed_approx,
-                    last_used: String::new(),
-                    broken: is_broken(&uninstall),
-                    install_location: loc.trim().trim_matches('"').to_string(),
-                },
-                uninstall,
-                est_kb: est as u64,
-            });
+            out.push(app);
         }
     }
     out
@@ -507,15 +519,20 @@ async fn list_apps() -> Result<Vec<AppInfo>, String> {
         let mut apps: Vec<AppInfo> = read_registry_apps()
             .into_par_iter()
             .map(|a| {
-                let used = last_used_for(&a, &ua);
+                // each app is measured in its own safety net, so one odd entry can't fail the list
+                let used = safely(|| last_used_for(&a, &ua)).unwrap_or_default();
+                let est = a.est_kb * 1024;
+                let loc = a.info.install_location.clone();
                 let mut info = a.info;
                 info.last_used = used;
-                let est = a.est_kb * 1024;
-                let real = if !info.install_location.is_empty() && Path::new(&info.install_location).exists() {
-                    dir_size(Path::new(&info.install_location))
-                } else {
-                    0
-                };
+                let real = safely(|| {
+                    if !loc.is_empty() && Path::new(&loc).exists() {
+                        dir_size(Path::new(&loc))
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
                 info.size = est.max(real);
                 info
             })
@@ -689,8 +706,10 @@ async fn get_app_icon(name: String, version: String) -> Result<Option<String>, S
         let app = read_registry_apps()
             .into_iter()
             .find(|a| a.info.name == name && a.info.version == version)?;
-        let (path, idx) = icon_source(&app)?;
-        let png = extract_icon_png(&path, idx)?;
+        let png = safely(|| {
+            let (path, idx) = icon_source(&app)?;
+            extract_icon_png(&path, idx)
+        })??;
         Some(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)))
     })
     .await
@@ -818,8 +837,7 @@ fn protected_conflict(p: &Path) -> Option<String> {
 }
 
 /// Shows a Windows notification (toast). Returns the real error if Windows refuses it.
-#[tauri::command]
-fn send_notification(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+fn notify_os(app: &tauri::AppHandle, title: String, body: String) -> Result<(), String> {
     use tauri_plugin_notification::NotificationExt;
     app.notification()
         .builder()
@@ -831,7 +849,9 @@ fn send_notification(app: tauri::AppHandle, title: String, body: String) -> Resu
 
 #[tauri::command]
 fn settings_load() -> String {
-    std::fs::read_to_string(data_dir().join("settings.json")).unwrap_or_else(|_| "{}".into())
+    std::fs::read_to_string(data_dir().join("settings.json"))
+        .map(|t| t.trim_start_matches('\u{feff}').to_string())
+        .unwrap_or_else(|_| "{}".into())
 }
 
 #[tauri::command]
@@ -1760,10 +1780,180 @@ async fn clean_cache(app: tauri::AppHandle, ids: Vec<String>, title: Option<Stri
     Ok(r)
 }
 
+// ---------- background: tray icon and drive monitor ----------
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct Prefs {
+    notify: Option<bool>,
+    warn_pct: Option<u32>,
+    run_in_tray: Option<bool>,
+}
+
+/// The few settings the background code needs, read from the same settings.json the window saves.
+fn read_prefs() -> Prefs {
+    std::fs::read_to_string(data_dir().join("settings.json"))
+        .ok()
+        // a file saved by Notepad can start with an invisible byte-order mark; JSON parsing rejects it
+        .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or_default()
+}
+
+/// 0 = fine, 1 = past the warning level, 2 = ten points past it.
+fn alert_level(pct: u32, warn: u32) -> u8 {
+    if pct >= warn + 10 {
+        2
+    } else if pct >= warn {
+        1
+    } else {
+        0
+    }
+}
+
+/// Notify only when a drive gets worse than it was, and never on the very first reading.
+fn should_notify(primed: bool, prev: Option<u8>, now: u8, notify: bool, warn: u32) -> bool {
+    primed && notify && warn <= 100 && prev.map_or(false, |p| now > p)
+}
+
+fn fmt_bytes(b: u64) -> String {
+    let gb = 1024f64 * 1024.0 * 1024.0;
+    let b = b as f64;
+    if b >= gb {
+        format!("{:.0} GB", b / gb)
+    } else {
+        format!("{:.0} MB", b / (1024.0 * 1024.0))
+    }
+}
+
+/// Checks the drives every 5 minutes for as long as Dustoff is running (window open or hidden in the tray).
+fn start_drive_monitor(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut levels: HashMap<String, u8> = HashMap::new();
+        let mut primed = false;
+        let mut last_warn: Option<u32> = None;
+        loop {
+            let prefs = read_prefs();
+            let warn = prefs.warn_pct.unwrap_or(80);
+            let notify = prefs.notify.unwrap_or(true);
+            if last_warn != Some(warn) {
+                // the level changed: take a fresh reading without sending a notification for it
+                primed = false;
+                last_warn = Some(warn);
+            }
+            if let Some(drives) = safely(list_drives) {
+                for d in drives {
+                    if d.total == 0 {
+                        continue;
+                    }
+                    let pct = (((d.total - d.free) as f64 / d.total as f64) * 100.0).round() as u32;
+                    let now = alert_level(pct, warn);
+                    let prev = levels.insert(d.letter.clone(), now);
+                    if should_notify(primed, prev, now, notify, warn) {
+                        let _ = notify_os(
+                            &app,
+                            format!("{}: is {}% full", d.letter, pct),
+                            format!("{} free of {}. Open Dustoff and run Smart clean to free some space.", fmt_bytes(d.free), fmt_bytes(d.total)),
+                        );
+                    }
+                }
+                primed = true;
+            }
+            std::thread::sleep(Duration::from_secs(300));
+        }
+    });
+}
+
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let open = MenuItem::with_id(app, "open", "Open Dustoff", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Dustoff", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("Dustoff")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    let tray = builder.build(app)?;
+    tray.set_visible(read_prefs().run_in_tray.unwrap_or(false))?;
+    Ok(())
+}
+
+/// Shows or hides the tray icon when the setting is switched.
+#[tauri::command]
+fn set_tray(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if let Some(t) = app.tray_by_id("main") {
+        t.set_visible(enabled).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Once per run, tells the user where Dustoff went when its window is closed into the tray.
+fn tray_hint(app: &tauri::AppHandle) {
+    if !TRAY_HINT_SHOWN.swap(true, Ordering::SeqCst) {
+        let _ = notify_os(
+            app,
+            "Dustoff is still running".into(),
+            "It's in the system tray so it can keep watching your drives. Right-click the tray icon and choose Quit to exit.".into(),
+        );
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // a second launch (for example the Start Menu while Dustoff sits in the tray) just opens the existing window
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .setup(|app| {
+            let handle = app.handle().clone();
+            build_tray(&handle)?;
+            start_drive_monitor(handle);
+            // The window is created hidden (see tauri.conf.json). A start with Windows (--minimized) with tray
+            // mode on stays in the tray; every other start shows the window right away.
+            let quiet_start = std::env::args().any(|a| a == "--minimized") && read_prefs().run_in_tray.unwrap_or(false);
+            if !quiet_start {
+                show_main(app.handle());
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" && read_prefs().run_in_tray.unwrap_or(false) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    tray_hint(window.app_handle());
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             list_drives,
             user_profile,
@@ -1791,7 +1981,7 @@ pub fn run() {
             open_data_folder,
             settings_load,
             settings_save,
-            send_notification,
+            set_tray,
             remove_broken_entry
         ])
         .run(tauri::generate_context!())
@@ -1914,6 +2104,45 @@ mod tests {
                 assert!(plain, "{} is unexpectedly treated as a link: {}", d.id, p.display());
             }
         }
+    }
+
+    // Extra protection: a panic while handling one entry is contained and just skips that entry.
+    #[test]
+    fn a_panic_in_one_entry_is_contained() {
+        let bad: Option<u32> = safely(|| {
+            let v: Vec<u32> = Vec::new();
+            v[3] // out-of-bounds: panics
+        });
+        assert_eq!(bad, None);
+        assert_eq!(safely(|| 7), Some(7));
+        // the same pattern the registry reader uses: a panicking entry among good ones is skipped
+        let parsed: Vec<u32> = (0..5u32)
+            .filter_map(|i| safely(|| if i == 2 { panic!("malformed entry") } else { Some(i) }))
+            .flatten()
+            .collect();
+        assert_eq!(parsed, vec![0, 1, 3, 4]);
+    }
+
+    // Background drive alerts: when to notify, and when to stay quiet.
+    #[test]
+    fn drive_alert_levels_and_rules() {
+        assert_eq!(alert_level(50, 80), 0);
+        assert_eq!(alert_level(80, 80), 1);
+        assert_eq!(alert_level(89, 80), 1);
+        assert_eq!(alert_level(90, 80), 2);
+        // never at the first reading, even if the drive is already full
+        assert!(!should_notify(false, None, 2, true, 80));
+        // fine -> warning, and warning -> critical, notify
+        assert!(should_notify(true, Some(0), 1, true, 80));
+        assert!(should_notify(true, Some(1), 2, true, 80));
+        // no repeats while it stays at the same level, none when it improves
+        assert!(!should_notify(true, Some(1), 1, true, 80));
+        assert!(!should_notify(true, Some(2), 1, true, 80));
+        // a newly appeared drive (no previous level) stays quiet
+        assert!(!should_notify(true, None, 2, true, 80));
+        // switched off, or the "Never" setting (101)
+        assert!(!should_notify(true, Some(0), 1, false, 80));
+        assert!(!should_notify(true, Some(0), 1, true, 101));
     }
 
     #[test]

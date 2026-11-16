@@ -22,7 +22,7 @@ const store = {
 // ---------- settings (saved on this PC) ----------
 // The master copy lives in the Dustoff data folder (settings.json). The browser copy below is only a
 // fast cache so the first screen already has the right theme before the file has been read.
-const SETTINGS_DEFAULTS = { theme: "system", startPage: "dashboard", storageView: "list", permanentLeftovers: false, smartPreview: true, warnPct: 80, notify: true };
+const SETTINGS_DEFAULTS = { theme: "system", startPage: "dashboard", storageView: "list", permanentLeftovers: false, smartPreview: true, warnPct: 80, notify: true, runInTray: false };
 let settings = { ...SETTINGS_DEFAULTS };
 try { settings = { ...SETTINGS_DEFAULTS, ...JSON.parse(store.get("settings", "{}")) }; } catch (_) {}
 let settingsReady = false; // true once settings.json has been read, so defaults never overwrite it
@@ -335,47 +335,20 @@ async function loadDrives() {
     renderDrives();
     $("#st-drive").innerHTML = drives.map((d) => `<option value="${d.letter}">${d.letter}:</option>`).join("");
     updatePathBar();
-    evaluateAlerts();
   } catch (e) { toast.error("Couldn't read your drives", errText(e)); }
 }
 
-// ---------- drive alerts: periodic check and Windows notification ----------
-const driveLevel = {};
-let alertsPrimed = false;
+// ---------- keep the Dashboard fresh ----------
+// The drive-full Windows notifications are sent by Dustoff's background monitor (it keeps running when the
+// window is hidden in the tray), so this only refreshes what the window shows.
 let lastDriveCheck = 0;
-const pctUsed = (d) => Math.round(((d.total - d.free) / d.total) * 100);
-const levelFor = (pct) => (pct >= settings.warnPct + 10 ? 2 : pct >= settings.warnPct ? 1 : 0);
-
-// Sent from the Rust side so a failure comes back with a real reason instead of failing silently.
-async function sendNotification(title, body) {
-  try { await invoke("send_notification", { title, body }); return { ok: true }; }
-  catch (e) { return { ok: false, error: errText(e) }; }
-}
-// Notifies only when a drive gets worse (for example from fine to warning), never at launch.
-function evaluateAlerts() {
-  for (const d of drives) {
-    const pct = pctUsed(d), lvl = levelFor(pct);
-    const prev = driveLevel[d.letter];
-    if (alertsPrimed && prev !== undefined && lvl > prev && settings.notify && settings.warnPct <= 100) {
-      const title = `${d.letter}: is ${pct}% full`;
-      const body = `${fmt(d.free)} free of ${fmt(d.total)}. Open Dustoff and run Smart clean to free some space.`;
-      sendNotification(title, body).then((r) => { if (!r.ok) toast.warning(title, `${body} (Windows notification failed: ${r.error})`); });
-    }
-    driveLevel[d.letter] = lvl;
-  }
-  alertsPrimed = true;
-}
-async function checkDrives(force = false) {
-  if (!force && Date.now() - lastDriveCheck < 30000) return;
+async function checkDrives() {
+  if (Date.now() - lastDriveCheck < 30000) return;
   lastDriveCheck = Date.now();
-  try {
-    drives = await invoke("list_drives");
-    renderDrives();
-    evaluateAlerts();
-  } catch (_) {}
+  try { drives = await invoke("list_drives"); renderDrives(); } catch (_) {}
 }
-setInterval(() => checkDrives(), 5 * 60 * 1000);
-window.addEventListener("focus", () => checkDrives());
+setInterval(checkDrives, 5 * 60 * 1000);
+window.addEventListener("focus", checkDrives);
 function renderDrives() {
   $("#drive-chips").innerHTML = drives.length > 1
     ? drives.map((d) => {
@@ -1059,6 +1032,8 @@ function syncSettingsUI() {
   $("#set-preview").checked = settings.smartPreview;
   $("#set-warn").value = String(settings.warnPct);
   $("#set-notify").checked = settings.notify;
+  $("#set-tray").checked = settings.runInTray;
+  $("#set-autostart").disabled = !settings.runInTray;
 }
 async function loadSettingsPage() {
   syncSettingsUI();
@@ -1066,17 +1041,37 @@ async function loadSettingsPage() {
   let v = "0.1.0";
   try { if (T && T.app && T.app.getVersion) v = await T.app.getVersion(); } catch (_) {}
   $("#set-version").textContent = `Dustoff ${v} · MIT license`;
+  try { $("#set-autostart").checked = !!(T && T.autostart && (await T.autostart.isEnabled())); } catch (_) {}
 }
 $("#set-start").addEventListener("change", (e) => { settings.startPage = e.target.value; saveSettings(); });
 $("#set-view").addEventListener("change", (e) => { setView(e.target.value); });
 $("#set-perm").addEventListener("change", (e) => { settings.permanentLeftovers = e.target.checked; saveSettings(); });
 $("#set-preview").addEventListener("change", (e) => { settings.smartPreview = e.target.checked; saveSettings(); });
 $("#set-warn").addEventListener("change", (e) => {
-  settings.warnPct = Number(e.target.value); saveSettings(); renderDrives();
-  for (const d of drives) driveLevel[d.letter] = levelFor(pctUsed(d)); // re-baseline so changing the level doesn't fire a notification
- 
+  settings.warnPct = Number(e.target.value); saveSettings(); renderDrives(); // the background monitor re-reads this and starts fresh
 });
 $("#set-notify").addEventListener("change", (e) => { settings.notify = e.target.checked; saveSettings(); });
+$("#set-tray").addEventListener("change", async (e) => {
+  settings.runInTray = e.target.checked;
+  saveSettings();
+  try { await invoke("set_tray", { enabled: settings.runInTray }); } catch (_) {}
+  $("#set-autostart").disabled = !settings.runInTray;
+  if (!settings.runInTray && $("#set-autostart").checked) {
+    // starting with Windows only makes sense when Dustoff can stay in the tray
+    try { await T.autostart.disable(); } catch (_) {}
+    $("#set-autostart").checked = false;
+  }
+});
+$("#set-autostart").addEventListener("change", async (e) => {
+  const want = e.target.checked;
+  try {
+    if (!T || !T.autostart) throw new Error("Start with Windows isn't available in this build.");
+    if (want) await T.autostart.enable(); else await T.autostart.disable();
+  } catch (err) {
+    e.target.checked = !want;
+    toast.error("Couldn't change the startup setting", errText(err));
+  }
+});
 document.querySelectorAll("#theme-seg .seg-btn").forEach((b) => b.addEventListener("click", () => { applyTheme(b.dataset.theme); }));
 $("#set-open").onclick = async () => { try { await invoke("open_data_folder"); } catch (e) { toast.error("Couldn't open the folder", errText(e)); } };
 $("#set-reset").onclick = () => {

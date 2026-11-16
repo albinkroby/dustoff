@@ -198,8 +198,20 @@
             </select>
           </div>
           <div class="srow">
-            <div class="grow"><div class="stitle">Windows notification</div><div class="small muted">Dustoff checks your drives every few minutes while it's open, and sends a notification when one passes the level above. It can't alert you while Dustoff is closed.</div></div>
+            <div class="grow"><div class="stitle">Windows notification</div><div class="small muted">Dustoff checks your drives every 5 minutes and sends a Windows notification when one passes the level above. It works while Dustoff is open, or hidden in the tray if you turn that on below.</div></div>
             <label class="switch"><input type="checkbox" id="set-notify" /><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <div class="card list sec">
+          <div class="card-title">Background</div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Keep running in the tray when closed</div><div class="small muted">Closing the window hides Dustoff to the system tray instead of quitting, so drive-full alerts keep working. To quit completely, right-click the tray icon and choose Quit.</div></div>
+            <label class="switch"><input type="checkbox" id="set-tray" /><span class="slider"></span></label>
+          </div>
+          <div class="srow">
+            <div class="grow"><div class="stitle">Start with Windows</div><div class="small muted">Opens Dustoff quietly in the tray when you sign in. Needs the option above.</div></div>
+            <label class="switch"><input type="checkbox" id="set-autostart" /><span class="slider"></span></label>
           </div>
         </div>
 

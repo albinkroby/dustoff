@@ -6,13 +6,14 @@ Built with [Tauri 2](https://tauri.app) (Rust backend, plain HTML/CSS/JavaScript
 
 ## Features
 
-- **Dashboard** with free space for every drive, one-click **Smart clean** (safe items only, with a preview), and a warning banner when a drive is almost full. While the app is open it rechecks your drives every few minutes and can send a Windows notification when a drive gets fuller than your chosen level.
+- **Dashboard** with free space for every drive, one-click **Smart clean** (safe items only, with a preview), and a warning banner when a drive is almost full. Dustoff rechecks your drives every 5 minutes and can send a Windows notification when a drive gets fuller than your chosen level. This works while the app is open, and also while it runs hidden in the system tray (optional, see Settings).
 - **Storage** browser with list and treemap views, an editable path bar, back/forward/up navigation, live parallel scanning, and a right-click menu (open, show in Explorer, copy path, protect, move to the Recycle Bin).
 - **Apps**: installed programs with real icons, sizes, install dates and last-used dates. "Uninstall + clean" runs the app's own uninstaller, then offers leftover folders for review. Apps whose uninstaller is already gone are flagged as broken entries and can be removed from Windows' list.
 - **Files**: large file finder and exact duplicate finder (matched by content hash). Files go to the Recycle Bin only, and every copy in a group cannot be removed at once.
 - **Cleanup**: temp files, thumbnail and shader caches, error reports, npm and pip caches, plus optional browser, Discord and VS Code caches and the Recycle Bin, with a progress bar.
 - **Safety**: protected folders Dustoff will never touch, and an activity log of everything it removed, with one-click restore for items in the Recycle Bin.
 - **Settings**: theme, start page, default view, cleaning preferences and the nearly-full warning level. Settings, protected folders and the log are stored in `%APPDATA%\Dustoff`.
+- **Background (optional)**: keep Dustoff running in the system tray when you close the window so drive-full alerts keep working, and optionally start with Windows. Right-click the tray icon and choose Quit to exit. Off by default.
 - Light and dark themes.
 
 ## Safety

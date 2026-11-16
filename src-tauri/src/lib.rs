@@ -301,8 +301,13 @@ fn uninstall_exe(s: &str) -> Option<PathBuf> {
         let end = rest.find('"')?;
         return Some(PathBuf::from(&rest[..end]));
     }
-    let lower = s.to_lowercase();
-    lower.find(".exe").map(|i| PathBuf::from(&s[..i + 4]))
+    // Search the original string byte-wise (ASCII case-insensitive) rather than a lowercased
+    // copy: lowercasing can change byte lengths, so its offsets are not valid indices into `s`.
+    let i = s
+        .as_bytes()
+        .windows(4)
+        .position(|w| w.eq_ignore_ascii_case(b".exe"))?;
+    s.get(..i + 4).map(PathBuf::from)
 }
 
 /// True only when the uninstall command points at an absolute path that no longer exists.
@@ -578,7 +583,9 @@ fn icon_source(a: &RawApp) -> Option<(PathBuf, i32)> {
                     && !name_of(p).to_lowercase().starts_with("unins")
             })
             .collect();
-        exes.sort_by_key(|p| !norm(&name_of(p)).contains(&n[..n.len().min(5)]));
+        // Prefix by characters, not bytes: `n` may hold multi-byte characters, so a byte slice could split one and panic.
+        let prefix: String = n.chars().take(5).collect();
+        exes.sort_by_key(|p| !norm(&name_of(p)).contains(&prefix));
         if let Some(p) = exes.into_iter().next() {
             return Some((p, 0));
         }
@@ -1549,9 +1556,51 @@ fn cache_defs() -> Vec<CacheDef> {
     ]
 }
 
+/// Whether `p` is a junction or symlink (a reparse point that redirects to another path).
+/// `None` when its attributes cannot be read. Only the directory-entry attributes are read,
+/// so this works for entries whose ACL denies the caller read access.
+fn is_reparse_point(p: &Path) -> Option<bool> {
+    std::fs::symlink_metadata(p).ok().map(|m| m.file_type().is_symlink())
+}
+
+fn same_path_ci(a: &Path, b: &Path) -> bool {
+    let parts = |p: &Path| p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>();
+    parts(a) == parts(b)
+}
+
+/// True when a cache root, and every directory between it and the profile or Windows folder it
+/// lives under, is a real directory rather than a junction or symlink. Those folders are writable
+/// by the user, so a redirected one would point the cleanup at somewhere it must never delete.
+fn cache_path_is_plain(root: &Path) -> bool {
+    let bases: Vec<PathBuf> = ["LOCALAPPDATA", "APPDATA", "SystemRoot"].iter().filter_map(|k| env_path(k)).collect();
+    let is_base = |p: &Path| bases.iter().any(|b| same_path_ci(p, b));
+    let under_base = root.ancestors().skip(1).any(|a| is_base(a));
+    for p in root.ancestors() {
+        if under_base && is_base(p) {
+            break;
+        }
+        if is_reparse_point(p) != Some(false) {
+            return false;
+        }
+        if !under_base {
+            break;
+        }
+    }
+    true
+}
+
+/// A cleanup entry must be a plainly named direct child of a plain cache root, and not itself a
+/// link. Unlike canonicalize, this never opens the entry, so files the user can delete but not
+/// open are still cleaned.
+fn cache_entry_is_safe(child: &Path) -> bool {
+    child.file_name().is_some()
+        && child.parent().map_or(false, cache_path_is_plain)
+        && is_reparse_point(child) != Some(true)
+}
+
 fn cache_entries(d: &CacheDef) -> Vec<PathBuf> {
     let mut v = Vec::new();
-    for dir in d.paths.iter().filter(|p| p.is_dir()) {
+    for dir in d.paths.iter().filter(|p| p.is_dir() && cache_path_is_plain(p)) {
         let Ok(rd) = std::fs::read_dir(dir) else { continue };
         for e in rd.filter_map(|e| e.ok()) {
             let p = e.path();
@@ -1677,6 +1726,12 @@ async fn clean_cache(app: tauri::AppHandle, ids: Vec<String>, title: Option<Stri
                         continue;
                     }
                     let size = dir_size(&child);
+                    // re-checked right before deleting, after the slow size walk, to narrow the race
+                    if !cache_entry_is_safe(&child) {
+                        d_skipped += 1;
+                        done += 1;
+                        continue;
+                    }
                     let res = if child.is_dir() { std::fs::remove_dir_all(&child) } else { std::fs::remove_file(&child) };
                     match res {
                         Ok(()) => d_freed += size,
@@ -1757,6 +1812,108 @@ mod tests {
         assert!(!is_broken(r#""C:\Windows\System32\cmd.exe" /c echo hi"#));
         assert!(!is_broken("rundll32.exe shell32.dll,Control_RunDLL"));
         assert!(!is_broken(""));
+    }
+
+    // F1/F5: an unquoted UninstallString whose lowercase form changes byte length used to panic.
+    #[test]
+    fn unusual_uninstall_strings_never_panic() {
+        for s in ["İ.exe", "\u{212A}.exe", "ȺȺȺ.exe /x", r"C:\Program Files\İ app\İ.exe /S", ".EXE", "x.ExE y", "漢字.exe", ""] {
+            let _ = uninstall_exe(s);
+            let _ = is_broken(s);
+        }
+        assert_eq!(uninstall_exe("İ.exe"), Some(PathBuf::from("İ.exe")));
+        assert_eq!(uninstall_exe(r"C:\Tools\Setup.EXE /silent"), Some(PathBuf::from(r"C:\Tools\Setup.EXE")));
+        assert_eq!(uninstall_exe("MsiExec.exe /X{1}"), None);
+    }
+
+    // F2/F4: slicing a normalised non-ASCII app name at byte 5 used to panic.
+    #[test]
+    fn icon_lookup_handles_non_ascii_app_names() {
+        let dir = std::env::temp_dir().join(format!("dustoff_icon_{}", now_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("a.exe")).unwrap();
+        std::fs::File::create(dir.join("b.exe")).unwrap();
+        for name in ["Яндекс Браузер", "微信 WeChat", "Ünïcödé App"] {
+            let app = RawApp {
+                info: AppInfo {
+                    name: name.into(),
+                    version: "1".into(),
+                    publisher: String::new(),
+                    size: 0,
+                    install_location: dir.to_string_lossy().into_owned(),
+                    installed: String::new(),
+                    installed_approx: false,
+                    last_used: String::new(),
+                    broken: false,
+                },
+                uninstall: "x".into(),
+                est_kb: 0,
+                display_icon: String::new(),
+                hive: 2,
+                key_name: "t".into(),
+            };
+            let _ = icon_source(&app); // must not panic
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    // F3: a junction planted where a cache folder should be must never be followed and emptied.
+    #[test]
+    fn cache_cleanup_refuses_junctions() {
+        let base = std::env::temp_dir().join(format!("dustoff_junc_{}", now_millis()));
+        let victim = base.join("victim");
+        let real_cache = base.join("cache");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::create_dir_all(&real_cache).unwrap();
+        std::fs::write(victim.join("precious.txt"), "do not delete").unwrap();
+        std::fs::write(real_cache.join("file.tmp"), "cache").unwrap();
+
+        let link_root = base.join("link_root");
+        let inner_link = real_cache.join("inner_link");
+        if !make_junction(&link_root, &victim) || !make_junction(&inner_link, &victim) {
+            eprintln!("could not create a junction on this machine; skipping");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        assert!(!cache_path_is_plain(&link_root), "a junction used as a cache root must be rejected");
+        assert!(cache_path_is_plain(&real_cache), "a normal cache folder must still be accepted");
+        assert!(!cache_entry_is_safe(&inner_link), "a junction inside a cache folder must be rejected");
+        assert!(cache_entry_is_safe(&real_cache.join("file.tmp")), "a normal cache file must still be accepted");
+
+        let def = CacheDef { id: "t", label: "t", note: "t", paths: vec![link_root.clone()], prefix: None, default_on: false, kind: CacheKind::Folder };
+        assert!(cache_entries(&def).is_empty(), "nothing is listed for deletion behind a junction root");
+        assert!(victim.join("precious.txt").exists(), "the target of the junction must be untouched");
+
+        // remove the links first so cleanup can never reach the victim folder
+        let _ = std::fs::remove_dir(&link_root);
+        let _ = std::fs::remove_dir(&inner_link);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // The fix must not stop legitimate cleaning on this PC.
+    #[test]
+    fn real_cache_folders_on_this_pc_are_still_cleanable() {
+        let temp = env_path("TEMP").expect("TEMP is set");
+        assert!(cache_path_is_plain(&temp), "your TEMP folder is a link, so cleaning it would now be skipped");
+        for d in cache_defs() {
+            for p in d.paths.iter().filter(|p| p.is_dir()) {
+                let plain = cache_path_is_plain(p);
+                println!("{:<8} plain={:<5} entries={:<5} {}", d.id, plain, if plain { cache_entries(&d).len() } else { 0 }, p.display());
+                assert!(plain, "{} is unexpectedly treated as a link: {}", d.id, p.display());
+            }
+        }
     }
 
     #[test]

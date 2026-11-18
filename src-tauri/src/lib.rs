@@ -197,6 +197,29 @@ fn known_folders() -> Vec<String> {
         .collect()
 }
 
+/// Checks a folder before it is opened: it must exist and really be a folder.
+fn folder_to_open(path: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(path.trim());
+    if !p.exists() {
+        return Err("That folder no longer exists".into());
+    }
+    if !p.is_dir() {
+        return Err("That isn't a folder".into());
+    }
+    Ok(p)
+}
+
+/// Opens a folder in File Explorer, going inside it (unlike `reveal_path`, which highlights it in its parent).
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    let p = folder_to_open(&path)?;
+    std::process::Command::new("explorer.exe")
+        .arg(&p)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Couldn't open File Explorer: {}", e))
+}
+
 #[tauri::command]
 fn reveal_path(path: String) -> Result<(), String> {
     let p = PathBuf::from(&path);
@@ -1655,35 +1678,121 @@ fn empty_recycle_bin() -> bool {
     unsafe { SHEmptyRecycleBinW(std::mem::zeroed(), std::ptr::null(), 0x7) == 0 }
 }
 
+/// What the Cleanup page needs to show an item right away. Sizes are measured separately, one item at a time.
 #[derive(Serialize)]
-struct CacheTarget {
+struct CacheInfo {
     id: String,
     label: String,
     note: String,
-    size: u64,
+    /// Section heading: System, Browsers, Developer tools or Apps.
+    group: String,
+    /// "safe" (rebuilds itself), "close_app" (best with the app closed) or "final" (cannot be undone and worth a look first).
+    risk: String,
+    /// Friendly name of the app that uses it, for "X is running" warnings.
+    app: String,
+    /// The folders that will be cleaned (only ones that exist).
+    paths: Vec<String>,
+    /// Set when only some files in those folders are cleaned, for example `thumbcache_*`.
+    pattern: String,
+    /// Lower-case program names whose running state matters (for example `chrome.exe`).
+    processes: Vec<String>,
     default_on: bool,
 }
 
+/// (group, risk, app name, process names) for each cleanup item.
+fn cache_meta(id: &str) -> (&'static str, &'static str, &'static str, &'static [&'static str]) {
+    match id {
+        "temp" | "wintemp" | "thumbs" | "d3d" | "nvidia" | "wer" | "crash" => ("System", "safe", "", &[]),
+        "recycle" => ("System", "final", "", &[]),
+        "npm" | "pip" => ("Developer tools", "safe", "", &[]),
+        "chrome" | "chromeai" => ("Browsers", "close_app", "Chrome", &["chrome.exe"]),
+        "edge" => ("Browsers", "close_app", "Edge", &["msedge.exe"]),
+        "brave" => ("Browsers", "close_app", "Brave", &["brave.exe"]),
+        "firefox" => ("Browsers", "close_app", "Firefox", &["firefox.exe"]),
+        "discord" => ("Apps", "close_app", "Discord", &["discord.exe"]),
+        "vscode" => ("Apps", "close_app", "VS Code", &["code.exe"]),
+        _ => ("Other", "safe", "", &[]),
+    }
+}
+
+/// Fast: no folder is measured here, so the page can show every row immediately.
 #[tauri::command]
-async fn cache_targets() -> Result<Vec<CacheTarget>, String> {
-    let r = tauri::async_runtime::spawn_blocking(|| {
-        let mut v: Vec<CacheTarget> = cache_defs()
-            .into_iter()
-            .map(|d| {
-                let size = match d.kind {
-                    CacheKind::RecycleBin => recycle_bin_size(),
-                    CacheKind::Folder => cache_entries(&d).par_iter().map(|p| dir_size(p)).sum(),
-                };
-                CacheTarget { id: d.id.into(), label: d.label.into(), note: d.note.into(), size, default_on: d.default_on }
+fn cache_list() -> Vec<CacheInfo> {
+    cache_defs()
+        .into_iter()
+        .filter_map(|d| {
+            let paths: Vec<String> = d
+                .paths
+                .iter()
+                .filter(|p| p.is_dir() && cache_path_is_plain(p))
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            if d.kind == CacheKind::Folder && paths.is_empty() {
+                return None; // nothing exists there on this PC
+            }
+            let (group, risk, app, processes) = cache_meta(d.id);
+            Some(CacheInfo {
+                id: d.id.into(),
+                label: d.label.into(),
+                note: d.note.into(),
+                group: group.into(),
+                risk: risk.into(),
+                app: app.into(),
+                paths,
+                pattern: d.prefix.map(|p| format!("{}*", p)).unwrap_or_default(),
+                processes: processes.iter().map(|s| s.to_string()).collect(),
+                default_on: d.default_on,
             })
-            .filter(|t| t.size > 0)
-            .collect();
-        v.sort_by(|a, b| b.size.cmp(&a.size));
-        v
+        })
+        .collect()
+}
+
+/// Measures one cleanup item. Called once per row so the page can fill sizes in as they arrive.
+#[tauri::command]
+async fn cache_size(id: String) -> Result<u64, String> {
+    let r = tauri::async_runtime::spawn_blocking(move || -> Result<u64, String> {
+        let def = cache_defs()
+            .into_iter()
+            .find(|d| d.id == id)
+            .ok_or_else(|| "Unknown cleanup item".to_string())?;
+        Ok(match def.kind {
+            CacheKind::RecycleBin => recycle_bin_size(),
+            CacheKind::Folder => cache_entries(&def).par_iter().map(|p| dir_size(p)).sum(),
+        })
     })
     .await
     .map_err(|e| e.to_string())?;
-    Ok(r)
+    r
+}
+
+/// Names (lower case) of every program that is running right now.
+fn running_process_names() -> HashSet<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    let mut out = HashSet::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut e);
+        while ok != 0 {
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            out.insert(String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase());
+            ok = Process32NextW(snap, &mut e);
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+#[tauri::command]
+fn running_processes() -> Vec<String> {
+    running_process_names().into_iter().collect()
 }
 
 #[derive(Serialize)]
@@ -1959,6 +2068,7 @@ pub fn run() {
             user_profile,
             known_folders,
             reveal_path,
+            open_folder,
             scan_folder,
             list_apps,
             get_app_icon,
@@ -1969,7 +2079,9 @@ pub fn run() {
             find_duplicates,
             cancel_files_scan,
             trash_files,
-            cache_targets,
+            cache_list,
+            cache_size,
+            running_processes,
             clean_cache,
             protected_list,
             protect_add,
@@ -2143,6 +2255,68 @@ mod tests {
         // switched off, or the "Never" setting (101)
         assert!(!should_notify(true, Some(0), 1, false, 80));
         assert!(!should_notify(true, Some(0), 1, true, 101));
+    }
+
+    // Cleanup page: every cleanup item has a group, so none ends up under a catch-all heading.
+    #[test]
+    fn every_cleanup_item_has_a_group_and_a_risk_label() {
+        for d in cache_defs() {
+            let (group, risk, _, _) = cache_meta(d.id);
+            assert_ne!(group, "Other", "{} has no group", d.id);
+            assert!(["safe", "close_app", "final"].contains(&risk), "{} has an unknown risk label", d.id);
+        }
+        // browsers and chat/editor apps carry the program names used for the "is running" warning
+        assert_eq!(cache_meta("chrome").3, &["chrome.exe"]);
+        assert!(cache_meta("temp").3.is_empty());
+        // only the Recycle Bin is flagged as final
+        assert_eq!(cache_defs().iter().filter(|d| cache_meta(d.id).1 == "final").count(), 1);
+    }
+
+    #[test]
+    fn running_process_list_sees_this_test_program() {
+        let me = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().to_lowercase();
+        let names = running_process_names();
+        assert!(names.contains(&me), "{} not found among {} running programs", me, names.len());
+    }
+
+    #[test]
+    fn cleanup_list_shows_only_folders_that_exist() {
+        let list = cache_list();
+        assert!(!list.is_empty());
+        for item in &list {
+            if item.id != "recycle" {
+                assert!(!item.paths.is_empty(), "{} is listed with no folder", item.id);
+            }
+            for p in &item.paths {
+                assert!(Path::new(p).is_dir(), "{} lists a folder that does not exist: {}", item.id, p);
+            }
+        }
+        // the Recycle Bin is always offered, even when it is empty
+        assert!(list.iter().any(|i| i.id == "recycle"));
+        // the thumbnail cache only touches its own files
+        if let Some(t) = list.iter().find(|i| i.id == "thumbs") {
+            assert_eq!(t.pattern, "thumbcache_*");
+        }
+    }
+    #[test]
+    fn open_folder_only_accepts_existing_folders() {
+        assert!(folder_to_open(r"C:\definitely\missing\folder").is_err());
+        let dir = std::env::temp_dir();
+        assert_eq!(folder_to_open(&dir.to_string_lossy()).unwrap(), dir);
+        // a file is not a folder
+        let file = std::env::temp_dir().join(format!("dustoff_file_{}.txt", now_millis()));
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(folder_to_open(&file.to_string_lossy()).unwrap_err(), "That isn't a folder");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    // Manual check (run with --ignored): really opens a window, so it is not part of the normal run.
+    #[test]
+    #[ignore]
+    fn open_folder_really_opens_explorer_inside_the_folder() {
+        let dir = std::env::temp_dir().join(std::env::var("DUSTOFF_OPEN_TEST_NAME").unwrap_or_else(|_| "dustoff_open_test".into()));
+        std::fs::create_dir_all(&dir).unwrap();
+        open_folder(dir.to_string_lossy().into_owned()).unwrap();
     }
 
     #[test]

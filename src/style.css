@@ -19,6 +19,7 @@ body{background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI",system-ui,s
 .nav:hover{background:var(--line)}
 .nav.on{background:var(--soft);color:var(--soft-t);font-weight:600}
 .side-note{margin:auto 6px 0;font-size:12px;color:var(--muted)}
+@media (max-height:560px){.side-note{display:none}}
 .main{flex:1;overflow:auto;padding:24px 28px}
 .page{animation:fade .25s ease}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
@@ -220,6 +221,38 @@ h1{font-size:22px;font-weight:600;margin:0 0 16px}
 .avatar.sh{background:var(--seg-bg);color:var(--muted)}
 .badge.warn{background:var(--warn-bg);color:var(--warn)}
 .badge.off{background:var(--seg-bg);color:var(--muted)}
+.badge.err{background:var(--err-bg);color:var(--err)}
+
+/* cleanup page */
+.link{padding:0;border:0;background:none;color:var(--accent);font:inherit;cursor:pointer}
+.link:hover{text-decoration:underline}
+.link:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+.cl-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0 10px}
+.cl-select{display:flex;align-items:center;gap:8px}
+.cl-lab{font-size:13px;color:var(--muted);margin-right:2px}
+.cl-select .btn.small-btn{padding:5px 14px;font-size:13px;color:var(--text);background:var(--card);border-color:var(--border-btn,var(--muted))}
+.cl-select .btn.small-btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.small-btn.on{background:var(--soft);color:var(--soft-t);border-color:transparent;font-weight:600}
+.cl-select .btn.small-btn.on{background:var(--soft);color:var(--soft-t);border-color:transparent}
+.loc-line .btn.small-btn,.locs .btn.small-btn{padding:2px 10px;font-size:12px;line-height:1.5}
+.cl-group{margin-bottom:14px;padding:4px 18px 6px}
+.cl-head{display:flex;align-items:center;gap:12px;padding:10px 0 6px}
+.cl-head .gname{font-weight:600;flex:1}
+.cl-head .gsize{color:var(--muted);font-size:13px}
+.crow{display:flex;align-items:flex-start;gap:12px;padding:11px 0;border-top:1px solid var(--line)}
+.crow-chk,.cl-head input{margin-top:3px;width:16px;height:16px;flex:none;accent-color:var(--accent);cursor:pointer}
+.cl-head input{margin-top:0}
+.crow .ttl{font-weight:500;cursor:pointer}
+.crow .ttl .badge{margin-left:8px;vertical-align:1px;font-weight:400}
+.crow .size{padding-top:1px}
+.warnline{margin-top:4px;color:var(--warn);font-size:13px}
+.locs{margin-top:5px;color:var(--muted);display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px}
+.loc-path{font-family:"Cascadia Mono",Consolas,monospace;font-size:12px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.loc-more{flex-basis:100%;display:flex;flex-direction:column;gap:3px;margin-top:2px}
+.loc-more .loc-line{display:flex;gap:10px;align-items:baseline}
+.loc-pat{font-size:12px}
+.cl-action{position:sticky;bottom:-24px;z-index:5;display:flex;align-items:center;justify-content:space-between;gap:14px;margin:6px -28px -24px;padding:12px 28px;background:var(--bg);border-top:1px solid var(--line)}
+.warnbox{margin:8px 0 0;padding:8px 12px;border-radius:8px;background:var(--warn-bg);color:var(--warn)}
 .title .badge{margin-left:6px;vertical-align:1px}
 .badge{font-size:12px;padding:2px 9px;border-radius:999px;background:var(--ok-bg);color:var(--ok);white-space:nowrap}
 

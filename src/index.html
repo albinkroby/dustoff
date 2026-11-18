@@ -119,9 +119,21 @@
 
       <section id="page-cleanup" class="page hidden">
         <div class="head"><h1>Cleanup</h1><button class="btn" id="refresh-cleanup" data-icon="refresh">Refresh</button></div>
-        <p class="muted">Caches that apps rebuild automatically. Safe items are ticked. Browser, app and Recycle Bin items start unticked so you choose them yourself. Files in use are skipped.</p>
-        <div class="card list"><div id="cache-list" class="muted pad">Loading…</div></div>
-        <div class="actions"><button class="btn primary" id="clean-btn">Clean selected</button></div>
+        <p class="muted">Caches that apps rebuild automatically. Each item shows the folders it cleans. Safe items are ticked; browsers, apps and the Recycle Bin start unticked so you choose them yourself. Files in use are skipped.</p>
+        <div class="cl-bar">
+          <div class="cl-select" role="group" aria-label="Quick select">
+            <span class="cl-lab">Select</span>
+            <button class="btn small-btn" data-sel="all" aria-pressed="false">All</button>
+            <button class="btn small-btn" data-sel="none" aria-pressed="false">None</button>
+            <button class="btn small-btn" data-sel="safe" aria-pressed="false" title="Tick only the items that rebuild themselves">Safe only</button>
+          </div>
+          <div class="small muted" id="cl-state"></div>
+        </div>
+        <div id="cache-list"><div class="card list"><div class="muted pad"><span class="spin"></span>Finding cleanup items…</div></div></div>
+        <div class="cl-action">
+          <div class="small muted" id="cl-summary"></div>
+          <button class="btn primary" id="clean-btn">Clean selected</button>
+        </div>
       </section>
       <section id="page-safety" class="page hidden">
         <div class="head"><h1>Safety</h1><button class="btn" id="refresh-safety" data-icon="refresh">Refresh</button></div>

@@ -136,6 +136,11 @@ async function reveal(path) {
   try { await invoke("reveal_path", { path }); }
   catch (e) { toast.error("Couldn't open File Explorer", errText(e)); }
 }
+// Opens a folder in File Explorer and goes inside it (reveal only highlights it in its parent folder).
+async function openFolder(path) {
+  try { await invoke("open_folder", { path }); }
+  catch (e) { toast.error("Couldn't open that folder", errText(e)); }
+}
 
 let apps = [];
 let sortBy = "size";
@@ -250,8 +255,10 @@ function menuFor(target) {
     const it = ($("#st-list")._items || [])[Number(st.dataset.i)];
     if (!it) return null;
     return [
-      it.is_dir && { label: "Open", icon: "folder", run: () => go(it.path) },
-      { label: "Show in File Explorer", icon: "external", run: () => reveal(it.path) },
+      it.is_dir && { label: "Browse here in Dustoff", icon: "folder", run: () => go(it.path) },
+      it.is_dir
+        ? { label: "Open in File Explorer", icon: "external", run: () => openFolder(it.path) }
+        : { label: "Show in File Explorer", icon: "external", run: () => reveal(it.path) },
       { label: "Copy path", icon: "copy", run: () => copyText(it.path) },
       it.is_dir && "-",
       it.is_dir && { label: "Never touch this folder", icon: "shield", run: () => protect(it.path) },
@@ -665,7 +672,9 @@ function renderList(items, list) {
     <div class="grow"><div class="title">${esc(it.name)}${it.is_dir ? "" : ' <span class="small muted">file</span>'}</div>
     <div class="barwrap"><div class="bar" style="width:${Math.max(1, (it.size / max) * 100)}%"></div></div></div>
     <div class="size">${fmt(it.size)}</div>
-    <button class="btn small-btn" data-reveal="${i}" title="Show in File Explorer">Show</button></div>`).join("");
+    ${it.is_dir
+      ? `<button class="btn small-btn" data-open-dir="${i}" title="Open this folder in File Explorer">Open</button>`
+      : `<button class="btn small-btn" data-reveal="${i}" title="Show this file in its folder">Show</button>`}</div>`).join("");
 }
 
 // squarified treemap
@@ -718,6 +727,8 @@ $("#st-list").addEventListener("click", async (e) => {
   const items = $("#st-list")._items || [];
   const rv = e.target.closest("[data-reveal]");
   if (rv) { reveal(items[Number(rv.dataset.reveal)].path); return; }
+  const od = e.target.closest("[data-open-dir]");
+  if (od) { openFolder(items[Number(od.dataset.openDir)].path); return; }
   const r = e.target.closest("[data-open]");
   if (r) go(items[Number(r.dataset.open)].path);
 });
@@ -858,23 +869,179 @@ $("#fl-trash").onclick = () => {
 };
 
 // ---------- cleanup ----------
+// Rows appear straight away from a fast list; each size is measured in the background and fills in as it arrives.
+const GROUP_ORDER = ["System", "Browsers", "Developer tools", "Apps"];
+let running = new Set();     // lower-case names of programs running right now
+let cacheLoadId = 0;
+let cachesMeasured = Promise.resolve();
+
+const isRunning = (c) => c.processes.some((p) => running.has(p));
+const shownCaches = () => caches.filter((c) => c.size !== 0);   // hide items that turned out to be empty
+
+function riskBadge(c) {
+  if (c.risk === "final") return '<span class="badge err" title="Emptying the Recycle Bin can\'t be undone">Can\'t undo</span>';
+  if (isRunning(c)) return '<span class="badge warn" title="The app is running right now">Running</span>';
+  if (c.risk === "close_app") return '<span class="badge warn" title="Works best with the app closed">Close the app first</span>';
+  return '<span class="badge" title="Rebuilds itself automatically">Safe</span>';
+}
+function locationsHtml(c) {
+  if (!c.paths.length) return '<span class="loc-path">All drives (Windows Recycle Bin)</span>';
+  const pat = c.pattern ? `<span class="loc-pat">only ${esc(c.pattern)} files</span>` : "";
+  const first = `<span class="loc-path" title="${esc(c.paths[0])}">${esc(c.paths[0])}</span><button class="btn small-btn" data-open="${esc(c.paths[0])}" title="Open this folder in File Explorer">Open</button>`;
+  if (c.paths.length === 1) return first + pat;
+  const rest = c.paths.slice(1).map((p) => `<div class="loc-line"><span class="loc-path" title="${esc(p)}">${esc(p)}</span><button class="btn small-btn" data-open="${esc(p)}" title="Open this folder in File Explorer">Open</button></div>`).join("");
+  return `${first}${pat}<button class="link" data-more="${esc(c.id)}">+${c.paths.length - 1} more</button><div class="loc-more hidden" id="more-${esc(c.id)}">${rest}</div>`;
+}
+function cacheRowHtml(c) {
+  const warn = isRunning(c) ? `<div class="warnline">${esc(c.app)} is running. Files it's using will be skipped until you close it.</div>` : "";
+  return `<div class="crow" data-id="${esc(c.id)}">
+    <input type="checkbox" class="crow-chk" id="cc-${esc(c.id)}" data-id="${esc(c.id)}" ${c.selected ? "checked" : ""} />
+    <div class="grow">
+      <label class="ttl" for="cc-${esc(c.id)}">${esc(c.label)}</label>${riskBadge(c)}
+      <div class="small muted">${esc(c.note)}</div>${warn}
+      <div class="small locs">${locationsHtml(c)}</div>
+    </div>
+    <div class="size" id="sz-${esc(c.id)}">${c.size === null ? '<span class="spin"></span>' : fmt(c.size)}</div></div>`;
+}
+function renderCaches() {
+  const list = $("#cache-list");
+  const items = shownCaches();
+  if (!items.length) {
+    list.innerHTML = `<div class="card list"><div class="muted pad">${caches.some((c) => c.size === null) ? '<span class="spin"></span>Measuring…' : "Nothing to clean right now"}</div></div>`;
+    updateCleanupSummary();
+    return;
+  }
+  const groups = [...new Set([...GROUP_ORDER, ...items.map((c) => c.group)])].filter((g) => items.some((c) => c.group === g));
+  list.innerHTML = groups.map((g) => {
+    const rows = items.filter((c) => c.group === g);
+    const known = rows.filter((c) => c.size !== null).reduce((s, c) => s + c.size, 0);
+    const pending = rows.some((c) => c.size === null);
+    return `<div class="card cl-group" data-group="${esc(g)}">
+      <div class="cl-head"><input type="checkbox" data-gsel="${esc(g)}" aria-label="Select all in ${esc(g)}" /><span class="gname">${esc(g)}</span><span class="gsize" id="gs-${esc(g.replace(/\W+/g, "_"))}">${known ? fmt(known) : ""}${pending ? (known ? " + " : "") + "measuring…" : ""}</span></div>
+      ${rows.map(cacheRowHtml).join("")}</div>`;
+  }).join("");
+  groups.forEach((g) => syncGroupBox(g));
+  updateCleanupSummary();
+}
+function syncGroupBox(g) {
+  const rows = shownCaches().filter((c) => c.group === g);
+  const box = document.querySelector(`[data-gsel="${CSS.escape(g)}"]`);
+  if (!box || !rows.length) return;
+  const n = rows.filter((c) => c.selected).length;
+  box.checked = n === rows.length;
+  box.indeterminate = n > 0 && n < rows.length;
+}
+function updateReclaim() {
+  const safe = caches.filter((c) => c.default_on);
+  const known = safe.filter((c) => c.size !== null).reduce((s, c) => s + c.size, 0);
+  const pending = safe.some((c) => c.size === null);
+  $("#reclaim").textContent = pending ? (known ? "about " + fmt(known) + " so far" : "Measuring…") : known ? "about " + fmt(known) : "Nothing to clean";
+}
+function updateCleanupSummary() {
+  const chosen = shownCaches().filter((c) => c.selected);
+  const pending = chosen.some((c) => c.size === null);
+  const known = chosen.filter((c) => c.size !== null).reduce((s, c) => s + c.size, 0);
+  $("#cl-summary").textContent = chosen.length ? `${plural(chosen.length, "item", "items")} selected · ${fmt(known)}${pending ? " so far, still measuring" : ""}` : "Nothing selected";
+  $("#clean-btn").textContent = chosen.length && !pending && known ? `Clean ${fmt(known)}` : "Clean selected";
+  const runningNow = shownCaches().filter(isRunning).map((c) => c.app);
+  $("#cl-state").textContent = runningNow.length ? `Running now: ${[...new Set(runningNow)].join(", ")}` : "";
+  // highlight which quick choice matches what is ticked right now
+  const shown = shownCaches();
+  const allOn = shown.length > 0 && shown.every((c) => c.selected);
+  const noneOn = shown.every((c) => !c.selected);
+  const safeOnly = shown.length > 0 && shown.every((c) => c.selected === (c.risk === "safe"));
+  const pressed = { all: allOn, none: noneOn && shown.length > 0, safe: safeOnly && !allOn };
+  document.querySelectorAll("[data-sel]").forEach((b) => {
+    const on = !!pressed[b.dataset.sel];
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+  });
+  updateReclaim();
+}
+async function measureCaches(my) {
+  const queue = [...caches];
+  const worker = async () => {
+    while (queue.length) {
+      const c = queue.shift();
+      let size = 0;
+      try { size = await invoke("cache_size", { id: c.id }); } catch (_) { size = 0; }
+      if (my !== cacheLoadId) return;
+      c.size = size;
+      if (size === 0) renderCaches();
+      else {
+        const cell = $("#sz-" + CSS.escape(c.id));
+        if (cell) cell.textContent = fmt(size);
+        const g = $(`[data-group="${CSS.escape(c.group)}"] .gsize`);
+        if (g) {
+          const rows = shownCaches().filter((x) => x.group === c.group);
+          const known = rows.filter((x) => x.size !== null).reduce((s, x) => s + x.size, 0);
+          const pending = rows.some((x) => x.size === null);
+          g.textContent = (known ? fmt(known) : "") + (pending ? (known ? " + " : "") + "measuring…" : "");
+        }
+        updateCleanupSummary();
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  if (my === cacheLoadId) renderCaches();
+}
 async function loadCaches() {
   loaded.cleanup = true;
+  const my = ++cacheLoadId;
   try {
-    caches = await invoke("cache_targets");
-    const total = caches.filter((c) => c.default_on).reduce((s, c) => s + c.size, 0);
-    $("#reclaim").textContent = total ? "about " + fmt(total) : "Nothing to clean";
-    $("#cache-list").className = "";
-    $("#cache-list").innerHTML = caches.length ? caches.map((c) => `<label class="row"><input type="checkbox" ${c.default_on ? "checked" : ""} data-id="${esc(c.id)}" />
-      <div class="grow"><div class="title">${esc(c.label)}</div><div class="small muted">${esc(c.note)}</div></div><div class="size">${fmt(c.size)}</div></label>`).join("") : '<div class="muted pad">Nothing to clean right now</div>';
+    const [list, procs] = await Promise.all([invoke("cache_list"), invoke("running_processes").catch(() => [])]);
+    if (my !== cacheLoadId) return;
+    running = new Set(procs);
+    const before = new Map(caches.map((c) => [c.id, c.selected]));
+    caches = list.map((c) => ({ ...c, size: null, selected: before.has(c.id) ? before.get(c.id) : c.default_on }));
+    renderCaches();
+    cachesMeasured = measureCaches(my);
+    await cachesMeasured;
   } catch (e) {
+    if (my !== cacheLoadId) return;
     loaded.cleanup = false;
-    $("#cache-list").className = "muted pad";
-    $("#cache-list").textContent = "Couldn't measure your caches.";
-    toast.error("Couldn't measure your caches", errText(e));
+    $("#cache-list").innerHTML = '<div class="card list"><div class="muted pad">Couldn\'t look for cleanup items.</div></div>';
+    toast.error("Couldn't look for cleanup items", errText(e));
   }
 }
-$("#refresh-cleanup").addEventListener("click", () => { $("#cache-list").className = "muted pad"; $("#cache-list").innerHTML = '<span class="spin"></span>Measuring…'; loadCaches(); });
+async function ensureCaches() {
+  if (!loaded.cleanup) await loadCaches();
+  await cachesMeasured;
+}
+$("#refresh-cleanup").addEventListener("click", () => loadCaches());
+
+// tick boxes, group boxes, select links, "Show" and "+N more"
+$("#cache-list").addEventListener("change", (e) => {
+  const box = e.target.closest(".crow-chk");
+  if (box) {
+    const c = caches.find((x) => x.id === box.dataset.id);
+    if (c) { c.selected = box.checked; syncGroupBox(c.group); updateCleanupSummary(); }
+    return;
+  }
+  const gbox = e.target.closest("[data-gsel]");
+  if (gbox) {
+    shownCaches().filter((c) => c.group === gbox.dataset.gsel).forEach((c) => { c.selected = gbox.checked; });
+    renderCaches();
+  }
+});
+$("#cache-list").addEventListener("click", (e) => {
+  const s = e.target.closest("[data-open]");
+  if (s) { openFolder(s.dataset.open); return; }
+  const m = e.target.closest("[data-more]");
+  if (m) {
+    const panel = $("#more-" + CSS.escape(m.dataset.more));
+    if (panel) {
+      const open = panel.classList.toggle("hidden") === false;
+      m.textContent = open ? "Hide" : `+${caches.find((c) => c.id === m.dataset.more).paths.length - 1} more`;
+    }
+  }
+});
+document.querySelectorAll("[data-sel]").forEach((b) => b.addEventListener("click", () => {
+  const mode = b.dataset.sel;
+  shownCaches().forEach((c) => { c.selected = mode === "all" ? true : mode === "none" ? false : c.risk === "safe"; });
+  renderCaches();
+}));
+
 // ---------- progress, smart clean, cleanup actions ----------
 function openProgress(title, sub = "Working…") {
   modal(`<h2>${esc(title)}</h2><p class="muted pg-label" id="pg-label">${esc(sub)}</p>
@@ -916,8 +1083,8 @@ async function runClean(ids, title, smart = false) {
 }
 
 async function smartClean() {
-  if (!caches.length) await loadCaches();
-  const items = caches.filter((c) => c.default_on);
+  await ensureCaches();
+  const items = caches.filter((c) => c.default_on && c.size > 0);
   if (!items.length) { toast.info("Nothing to clean", "No safe cache items were found right now."); return; }
   if (!settings.smartPreview) { runClean(items.map((c) => c.id), "Smart clean", true); return; }
   const total = items.reduce((s, c) => s + c.size, 0);
@@ -931,13 +1098,20 @@ async function smartClean() {
 $("#smart-clean").addEventListener("click", smartClean);
 
 $("#clean-btn").onclick = () => {
-  const ids = [...document.querySelectorAll("#cache-list input:checked")].map((c) => c.dataset.id);
-  if (!ids.length) { toast.warning("Nothing selected", "Select something to clean first."); return; }
-  const size = caches.filter((c) => ids.includes(c.id)).reduce((s, c) => s + c.size, 0);
-  modal(`<h2>Clean ${fmt(size)} of cache?</h2><p class="muted">These files are permanently deleted. Apps rebuild them when needed, and files in use are skipped.</p>
-    <div class="btns"><button class="btn" id="m-cancel">Cancel</button><button class="btn danger" id="m-go">Clean</button></div>`);
+  const items = shownCaches().filter((c) => c.selected);
+  if (!items.length) { toast.warning("Nothing selected", "Select something to clean first."); return; }
+  if (items.some((c) => c.size === null)) { toast.info("Still measuring", "Give it a moment for the sizes to finish, then try again."); return; }
+  const size = items.reduce((s, c) => s + c.size, 0);
+  const runningApps = [...new Set(items.filter(isRunning).map((c) => c.app))];
+  const hasBin = items.some((c) => c.risk === "final");
+  modal(`<h2>Clean ${fmt(size)}?</h2>
+    <p class="muted">These files are permanently deleted. Apps rebuild them when needed, and files in use are skipped.</p>
+    ${runningApps.length ? `<p class="small warnbox">${esc(runningApps.join(", "))} ${runningApps.length > 1 ? "are" : "is"} running, so some files will be skipped. Close ${runningApps.length > 1 ? "them" : "it"} first for a full clean.</p>` : ""}
+    ${hasBin ? `<p class="small warnbox">This empties the Recycle Bin. Files in it can't be restored afterwards.</p>` : ""}
+    <div class="rlist">${items.map((c) => `<div class="rrow"><span>${esc(c.label)}</span><span>${fmt(c.size)}</span></div>`).join("")}</div>
+    <div class="btns"><button class="btn" id="m-cancel">Cancel</button><button class="btn danger" id="m-go">Clean ${fmt(size)}</button></div>`);
   $("#m-cancel").onclick = closeModal;
-  $("#m-go").onclick = () => runClean(ids, "Cache cleanup");
+  $("#m-go").onclick = () => runClean(items.map((c) => c.id), "Cache cleanup");
 };
 
 // ---------- safety: protected folders and activity log ----------
